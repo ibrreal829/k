@@ -1,32 +1,71 @@
 <?php
+// Enable detailed error reporting for development. Disable in production.
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+
+// Start or resume the session
 session_start();
 
-// Database setup
+// --- Configuration ---
+// Define a secret key for encryption. This should be a strong, randomly generated string.
+// In a real production environment, consider loading this from environment variables
+// or a secure configuration file outside the web root.
+define('ENCRYPTION_SECRET_KEY', 'your_super_secret_password_manager_key_32_chars_long'); // CHANGE THIS!
+// This key is used to derive the actual encryption key from the user's master password.
+// A strong KDF should be used on the client-side for truly zero-knowledge, but for this
+// PHP-centric example, we'll derive it on the server using the user's login password.
+
+// --- Database Setup ---
+/**
+ * Manages the SQLite database connection and table creation for the password manager.
+ */
 class Database {
     private $db;
-    
+
     public function __construct() {
-        // Create or open the SQLite database file
-        $this->db = new SQLite3('notes_app.db');
+        // Create or open the SQLite database file in a secure location (outside web root in production)
+        $this->db = new SQLite3('password_manager.db');
         // Enable Write-Ahead Logging for better concurrency and performance
-        $this->db->exec('PRAGMA journal_mode = WAL;'); 
+        $this->db->exec('PRAGMA journal_mode = WAL;');
         $this->createTables();
     }
-    
+
+    /**
+     * Creates necessary tables if they don't exist, and adds missing columns.
+     */
     private function createTables() {
-        // Users table
+        // Users table to store user authentication details
         $this->db->exec('
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
-                session_version INTEGER DEFAULT 0, -- Column for session invalidation
+                session_version INTEGER DEFAULT 0, -- Used to invalidate sessions on password change
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ');
-        
-        // Add 'session_version' column if it doesn't exist (for existing databases)
+
+        // Passwords table to store encrypted password entries
+        $this->db->exec('
+            CREATE TABLE IF NOT EXISTS passwords (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                website TEXT NOT NULL,
+                username TEXT NOT NULL,
+                encrypted_password TEXT NOT NULL, -- Stores the encrypted password
+                iv TEXT NOT NULL,                -- Stores the Initialization Vector for AES encryption
+                url TEXT DEFAULT "",             -- URL for the website/service
+                notes TEXT DEFAULT "",           -- Additional notes
+                category TEXT DEFAULT "General", -- Category for the password entry
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ');
+
+        // Add 'session_version' column if it doesn't exist
         $result = $this->db->query("PRAGMA table_info(users);");
         $hasSessionVersionColumn = false;
         while ($col = $result->fetchArray(SQLITE3_ASSOC)) {
@@ -39,48 +78,151 @@ class Database {
             $this->db->exec("ALTER TABLE users ADD COLUMN session_version INTEGER DEFAULT 0");
         }
 
-        // Notes table with 'tags' column
-        $this->db->exec('
-            CREATE TABLE IF NOT EXISTS notes (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tags TEXT DEFAULT "", -- Column for comma-separated tags
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
-            )
-        ');
+        // Add new columns to passwords table if they don't exist
+        $this->addMissingPasswordColumns();
+    }
 
-        // Add 'tags' column if it doesn't exist
-        $result = $this->db->query("PRAGMA table_info(notes);");
-        $hasTagsColumn = false;
-        while ($col = $result->fetchArray(SQLITE3_ASSOC)) {
-            if ($col['name'] == 'tags') {
-                $hasTagsColumn = true;
-                break;
+    /**
+     * Adds missing columns to the 'passwords' table for upgrades.
+     */
+    private function addMissingPasswordColumns() {
+        $columns = [
+            'encrypted_password' => 'TEXT NOT NULL DEFAULT ""',
+            'iv' => 'TEXT NOT NULL DEFAULT ""',
+            'url' => 'TEXT DEFAULT ""',
+            'notes' => 'TEXT DEFAULT ""',
+            'category' => 'TEXT DEFAULT "General"',
+        ];
+
+        foreach ($columns as $columnName => $columnDefinition) {
+            $result = $this->db->query("PRAGMA table_info(passwords);");
+            $columnExists = false;
+            while ($col = $result->fetchArray(SQLITE3_ASSOC)) {
+                if ($col['name'] == $columnName) {
+                    $columnExists = true;
+                    break;
+                }
+            }
+            if (!$columnExists) {
+                // For 'encrypted_password' and 'iv', set a default value, though actual passwords will be encrypted.
+                // This is primarily for schema migration.
+                $defaultValue = ($columnName == 'encrypted_password' || $columnName == 'iv') ? "''" : "''";
+                $this->db->exec("ALTER TABLE passwords ADD COLUMN $columnName $columnDefinition");
+                error_log("Added column '$columnName' to 'passwords' table.");
             }
         }
-        if (!$hasTagsColumn) {
-            $this->db->exec("ALTER TABLE notes ADD COLUMN tags TEXT DEFAULT ''");
-        }
     }
-    
+
     public function getConnection() {
         return $this->db;
     }
 }
 
-// User class
+// --- Encryption Utility ---
+/**
+ * Provides methods for encrypting and decrypting data using AES-256-CBC.
+ */
+class Encryption {
+    private static $cipher = 'aes-256-cbc'; // Strong symmetric encryption algorithm
+
+    /**
+     * Encrypts a string using a given key.
+     *
+     * @param string $data The data to encrypt.
+     * @param string $key The encryption key.
+     * @return array|false An array containing 'encrypted' and 'iv' (base64 encoded), or false on failure.
+     */
+    public static function encrypt($data, $key) {
+        if (!function_exists('openssl_encrypt')) {
+            error_log("OpenSSL extension is not enabled. Cannot perform encryption.");
+            return false;
+        }
+
+        $iv_length = openssl_cipher_iv_length(self::$cipher);
+        $iv = openssl_random_pseudo_bytes($iv_length); // Generate a random IV for each encryption
+
+        $encrypted_data = openssl_encrypt($data, self::$cipher, $key, 0, $iv);
+
+        if ($encrypted_data === false) {
+            error_log("Encryption failed.");
+            return false;
+        }
+
+        return [
+            'encrypted' => base64_encode($encrypted_data),
+            'iv' => base64_encode($iv)
+        ];
+    }
+
+    /**
+     * Decrypts a string using a given key and IV.
+     *
+     * @param string $encrypted_data_b64 Base64 encoded encrypted data.
+     * @param string $iv_b64 Base64 encoded Initialization Vector.
+     * @param string $key The decryption key.
+     * @return string|false The decrypted data, or false on failure.
+     */
+    public static function decrypt($encrypted_data_b64, $iv_b64, $key) {
+        if (!function_exists('openssl_decrypt')) {
+            error_log("OpenSSL extension is not enabled. Cannot perform decryption.");
+            return false;
+        }
+
+        $encrypted_data = base64_decode($encrypted_data_b64);
+        $iv = base64_decode($iv_b64);
+
+        $decrypted_data = openssl_decrypt($encrypted_data, self::$cipher, $key, 0, $iv);
+
+        if ($decrypted_data === false) {
+            error_log("Decryption failed. Check key, IV, and data integrity.");
+            return false;
+        }
+        return $decrypted_data;
+    }
+
+    /**
+     * Derives a strong key from the user's master password.
+     * This is crucial for security.
+     *
+     * @param string $masterPassword The user's master password (login password).
+     * @param string $salt A unique salt for key derivation. Using a static salt for simplicity here,
+     * but ideally, it should be per-user and stored with the user record (not the master password hash).
+     * @return string The derived key.
+     */
+    public static function deriveKey($masterPassword, $salt = ENCRYPTION_SECRET_KEY) {
+        // Using PBKDF2 for key derivation. This makes brute-forcing harder.
+        // Adjust iterations based on desired security vs. performance.
+        $iterations = 10000;
+        $keyLength = 32; // 256 bits for AES-256
+        $algo = 'sha256';
+
+        // hash_pbkdf2 is a good choice for key derivation.
+        $derivedKey = hash_pbkdf2($algo, $masterPassword, $salt, $iterations, $keyLength, true); // raw_output = true for binary
+        return $derivedKey;
+    }
+}
+
+// --- User Class ---
+/**
+ * Handles user registration, login, and password management.
+ */
 class User {
     private $db;
-    
+
     public function __construct($database) {
         $this->db = $database->getConnection();
     }
-    
+
+    /**
+     * Registers a new user.
+     *
+     * @param string $username The user's chosen username.
+     * @param string $email The user's email address.
+     * @param string $password The user's chosen password (master password).
+     * @return bool True on success, false on failure (e.g., duplicate username/email).
+     */
     public function register($username, $email, $password) {
+        // Hash the master password for storage in the database
         $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
         $stmt = $this->db->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
         $stmt->bindValue(1, $username, SQLITE3_TEXT);
@@ -88,31 +230,51 @@ class User {
         $stmt->bindValue(3, $hashedPassword, SQLITE3_TEXT);
         return $stmt->execute();
     }
-    
-    public function login($username, $password) {
-        // Allow login using either username or email
+
+    /**
+     * Logs in a user.
+     *
+     * @param string $identifier Username or email.
+     * @param string $password The user's master password.
+     * @return array|false User data array on success, false on failure.
+     */
+    public function login($identifier, $password) {
         $stmt = $this->db->prepare('SELECT * FROM users WHERE username = ? OR email = ?');
-        $stmt->bindValue(1, $username, SQLITE3_TEXT);
-        $stmt->bindValue(2, $username, SQLITE3_TEXT);
+        $stmt->bindValue(1, $identifier, SQLITE3_TEXT);
+        $stmt->bindValue(2, $identifier, SQLITE3_TEXT);
         $result = $stmt->execute();
         $user = $result->fetchArray(SQLITE3_ASSOC);
-        
+
         if ($user && password_verify($password, $user['password'])) {
             // Store the current session version in $_SESSION
             $_SESSION['session_version'] = $user['session_version'];
+            // Derive and store the encryption key from the user's master password
+            $_SESSION['master_encryption_key'] = Encryption::deriveKey($password);
             return $user;
         }
         return false;
     }
 
-    // Method to increment session version for a user, invalidating other sessions
+    /**
+     * Increments the session version for a user, effectively logging out all other active sessions.
+     *
+     * @param int $userId The ID of the user.
+     * @return bool True on success, false on failure.
+     */
     public function incrementSessionVersion($userId) {
         $stmt = $this->db->prepare('UPDATE users SET session_version = session_version + 1 WHERE id = ?');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
         return $stmt->execute();
     }
 
-    // Method to change password, requiring old password and incrementing session version
+    /**
+     * Changes a user's master password. Requires the old password for verification.
+     *
+     * @param int $userId The ID of the user.
+     * @param string $oldPassword The user's current master password.
+     * @param string $newPassword The new master password.
+     * @return bool True on success, false on failure.
+     */
     public function changePassword($userId, $oldPassword, $newPassword) {
         // First, verify the old password
         $stmt = $this->db->prepare('SELECT password FROM users WHERE id = ?');
@@ -126,21 +288,33 @@ class User {
 
         // If old password is correct, hash and update the new password
         $hashedNewPassword = password_hash($newPassword, PASSWORD_DEFAULT);
-        $stmt = $this->db->prepare('UPDATE users SET password = ? WHERE id = ?');
+        $stmt = $this->db->prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?');
         $stmt->bindValue(1, $hashedNewPassword, SQLITE3_TEXT);
         $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
         $success = $stmt->execute();
 
         if ($success) {
-            // Increment session version to invalidate other sessions upon password change
-            $this->incrementSessionVersion($userId);
             // Update the session's stored version as well
-            $_SESSION['session_version'] = $_SESSION['session_version'] + 1;
+            if (isset($_SESSION['session_version'])) {
+                $_SESSION['session_version'] = $_SESSION['session_version'] + 1;
+            }
+            // If the user is logged in, update their encryption key in the session
+            if (isset($_SESSION['master_encryption_key'])) {
+                $_SESSION['master_encryption_key'] = Encryption::deriveKey($newPassword);
+            }
         }
         return $success;
     }
 
-    // New method for password change from login page (Forgot Password), requiring old password
+    /**
+     * Resets password from login page (e.g., Forgot Password flow).
+     * This version still requires the old password for security.
+     *
+     * @param string $identifier Username or email.
+     * @param string $oldPassword The current master password.
+     * @param string $newPassword The new master password.
+     * @return bool True on success, false on failure.
+     */
     public function resetPasswordFromLogin($identifier, $oldPassword, $newPassword) {
         // Find user by username or email
         $stmt = $this->db->prepare('SELECT id, password FROM users WHERE username = ? OR email = ?');
@@ -160,7 +334,7 @@ class User {
 
         // If old password is correct, hash and update the new password
         $hashedNewPassword = password_hash($newPassword, PASSWORD_DEFAULT);
-        $stmt = $this->db->prepare('UPDATE users SET password = ? WHERE id = ?');
+        $stmt = $this->db->prepare('UPDATE users SET password = ?, session_version = session_version + 1 WHERE id = ?');
         $stmt->bindValue(1, $hashedNewPassword, SQLITE3_TEXT);
         $stmt->bindValue(2, $user['id'], SQLITE3_INTEGER);
         $success = $stmt->execute();
@@ -168,100 +342,233 @@ class User {
         if ($success) {
             // Increment session version to invalidate other sessions upon password change
             $this->incrementSessionVersion($user['id']);
-            // Note: Current session is not logged out here. The centralized check will handle it on next page load.
         }
         return $success;
     }
 }
 
-// Notes class
-class Notes {
+// --- PasswordManager Class (formerly Notes) ---
+/**
+ * Manages password entries for users, including encryption/decryption.
+ */
+class PasswordManager {
     private $db;
-    
+    private $encryptionKey; // The derived encryption key for the current session
+
     public function __construct($database) {
         $this->db = $database->getConnection();
+        // The encryption key must be set after user login from the session
+        $this->encryptionKey = isset($_SESSION['master_encryption_key']) ? $_SESSION['master_encryption_key'] : null;
     }
-    
-    // Create a new note with title, content, and tags
-    public function create($userId, $title, $content, $tags = '') {
-        $stmt = $this->db->prepare('INSERT INTO notes (user_id, title, content, tags) VALUES (?, ?, ?, ?)');
+
+    /**
+     * Sets the encryption key for the current session.
+     * This is called after a successful login.
+     *
+     * @param string $key The derived encryption key.
+     */
+    public function setEncryptionKey($key) {
+        $this->encryptionKey = $key;
+    }
+
+    /**
+     * Checks if the encryption key is available.
+     *
+     * @return bool True if key is set, false otherwise.
+     */
+    private function isKeyAvailable() {
+        if ($this->encryptionKey === null) {
+            error_log("Encryption key is not set. User might not be logged in or session expired.");
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Adds a new password entry.
+     *
+     * @param int $userId The ID of the user.
+     * @param string $website The website/service name.
+     * @param string $username The username for the service.
+     * @param string $password The actual password (will be encrypted).
+     * @param string $url The URL of the website.
+     * @param string $notes Additional notes.
+     * @param string $category The category of the password.
+     * @return bool True on success, false on failure.
+     */
+    public function addPassword($userId, $website, $username, $password, $url, $notes, $category) {
+        if (!$this->isKeyAvailable()) return false;
+
+        $encrypted_data = Encryption::encrypt($password, $this->encryptionKey);
+        if ($encrypted_data === false) {
+            error_log("Failed to encrypt password during addition.");
+            return false;
+        }
+
+        $stmt = $this->db->prepare('INSERT INTO passwords (user_id, website, username, encrypted_password, iv, url, notes, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
-        $stmt->bindValue(2, $title, SQLITE3_TEXT);
-        $stmt->bindValue(3, $content, SQLITE3_TEXT);
-        $stmt->bindValue(4, $tags, SQLITE3_TEXT);
+        $stmt->bindValue(2, $website, SQLITE3_TEXT);
+        $stmt->bindValue(3, $username, SQLITE3_TEXT);
+        $stmt->bindValue(4, $encrypted_data['encrypted'], SQLITE3_TEXT);
+        $stmt->bindValue(5, $encrypted_data['iv'], SQLITE3_TEXT);
+        $stmt->bindValue(6, $url, SQLITE3_TEXT);
+        $stmt->bindValue(7, $notes, SQLITE3_TEXT);
+        $stmt->bindValue(8, $category, SQLITE3_TEXT);
         return $stmt->execute();
     }
-    
-    // Get all notes for a specific user, ordered by last updated
-    public function getUserNotes($userId) {
-        $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC');
+
+    /**
+     * Retrieves all password entries for a specific user.
+     * Decrypts passwords before returning.
+     *
+     * @param int $userId The ID of the user.
+     * @return array An array of password entries, with decrypted passwords.
+     */
+    public function getUserPasswords($userId) {
+        if (!$this->isKeyAvailable()) return [];
+
+        $stmt = $this->db->prepare('SELECT * FROM passwords WHERE user_id = ? ORDER BY website ASC');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
         $result = $stmt->execute();
-        
-        $notes = [];
+
+        $passwords = [];
         while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
-            $notes[] = $row;
+            $decrypted_password = Encryption::decrypt($row['encrypted_password'], $row['iv'], $this->encryptionKey);
+            // Replace the encrypted password with the decrypted one for display
+            $row['password'] = $decrypted_password !== false ? $decrypted_password : '[Decryption Failed]';
+            unset($row['encrypted_password']); // Remove raw encrypted data
+            unset($row['iv']); // Remove IV as it's not needed for display
+            $passwords[] = $row;
         }
-        return $notes;
+        return $passwords;
     }
-    
-    // Get a single note by ID and user ID
-    public function getNote($noteId, $userId) {
-        $stmt = $this->db->prepare('SELECT * FROM notes WHERE id = ? AND user_id = ?');
-        $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
+
+    /**
+     * Retrieves a single password entry by ID and user ID.
+     * Decrypts the password before returning.
+     *
+     * @param int $passwordId The ID of the password entry.
+     * @param int $userId The ID of the user.
+     * @return array|false The password entry array (with decrypted password), or false if not found.
+     */
+    public function getPassword($passwordId, $userId) {
+        if (!$this->isKeyAvailable()) return false;
+
+        $passwordId = (int)$passwordId;
+        $stmt = $this->db->prepare('SELECT * FROM passwords WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $passwordId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
         $result = $stmt->execute();
-        return $result->fetchArray(SQLITE3_ASSOC);
+        $entry = $result->fetchArray(SQLITE3_ASSOC);
+
+        if ($entry) {
+            $decrypted_password = Encryption::decrypt($entry['encrypted_password'], $entry['iv'], $this->encryptionKey);
+            $entry['password'] = $decrypted_password !== false ? $decrypted_password : '[Decryption Failed]';
+            unset($entry['encrypted_password']);
+            unset($entry['iv']);
+        }
+        return $entry;
     }
-    
-    // Update an existing note
-    public function update($noteId, $userId, $title, $content, $tags = '') {
-        $stmt = $this->db->prepare('UPDATE notes SET title = ?, content = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
-        $stmt->bindValue(1, $title, SQLITE3_TEXT);
-        $stmt->bindValue(2, $content, SQLITE3_TEXT);
-        $stmt->bindValue(3, $tags, SQLITE3_TEXT); 
-        $stmt->bindValue(4, $noteId, SQLITE3_INTEGER);
-        $stmt->bindValue(5, $userId, SQLITE3_INTEGER);
-        return $stmt->execute();
+
+    /**
+     * Updates an existing password entry.
+     * Encrypts the new password if it has changed.
+     *
+     * @param int $passwordId The ID of the password entry to update.
+     * @param int $userId The ID of the user.
+     * @param string $website The new website/service name.
+     * @param string $username The new username.
+     * @param string $password The new password (will be encrypted).
+     * @param string $url The new URL.
+     * @param string $notes New additional notes.
+     * @param string $category The new category.
+     * @return bool True on success, false on failure.
+     */
+    public function updatePassword($passwordId, $userId, $website, $username, $password, $url, $notes, $category) {
+        if (!$this->isKeyAvailable()) return false;
+
+        $encrypted_data = Encryption::encrypt($password, $this->encryptionKey);
+        if ($encrypted_data === false) {
+            error_log("Failed to encrypt password during update.");
+            return false;
+        }
+
+        $stmt = $this->db->prepare('UPDATE passwords SET website = ?, username = ?, encrypted_password = ?, iv = ?, url = ?, notes = ?, category = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $website, SQLITE3_TEXT);
+        $stmt->bindValue(2, $username, SQLITE3_TEXT);
+        $stmt->bindValue(3, $encrypted_data['encrypted'], SQLITE3_TEXT);
+        $stmt->bindValue(4, $encrypted_data['iv'], SQLITE3_TEXT);
+        $stmt->bindValue(5, $url, SQLITE3_TEXT);
+        $stmt->bindValue(6, $notes, SQLITE3_TEXT);
+        $stmt->bindValue(7, $category, SQLITE3_TEXT);
+        $stmt->bindValue(8, $passwordId, SQLITE3_INTEGER);
+        $stmt->bindValue(9, $userId, SQLITE3_INTEGER);
+        $success = $stmt->execute();
+
+        if (!$success) {
+            error_log("Password update failed. SQLite Error Code: " . $this->db->lastErrorCode() . " Error Message: " . $this->db->lastErrorMsg());
+        }
+        return $success;
     }
-    
-    // Delete a note
-    public function delete($noteId, $userId) {
-        $stmt = $this->db->prepare('DELETE FROM notes WHERE id = ? AND user_id = ?');
-        $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
+
+    /**
+     * Deletes a password entry.
+     *
+     * @param int $passwordId The ID of the password entry to delete.
+     * @param int $userId The ID of the user.
+     * @return bool True on success, false on failure.
+     */
+    public function deletePassword($passwordId, $userId) {
+        $stmt = $this->db->prepare('DELETE FROM passwords WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $passwordId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
         return $stmt->execute();
     }
 
-    // Search notes by title, content, or tags for a given user
-    public function searchNotes($userId, $searchTerm) {
-        $searchTerm = '%' . $searchTerm . '%'; 
-        $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? AND (title LIKE ? OR content LIKE ? OR tags LIKE ?) ORDER BY updated_at DESC');
+    /**
+     * Searches password entries by website, username, URL, notes, or category for a given user.
+     * Decrypts passwords before returning.
+     *
+     * @param int $userId The ID of the user.
+     * @param string $searchTerm The search term.
+     * @return array An array of matching password entries, with decrypted passwords.
+     */
+    public function searchPasswords($userId, $searchTerm) {
+        if (!$this->isKeyAvailable()) return [];
+
+        $searchTerm = '%' . $searchTerm . '%';
+        $stmt = $this->db->prepare('SELECT * FROM passwords WHERE user_id = ? AND (website LIKE ? OR username LIKE ? OR url LIKE ? OR notes LIKE ? OR category LIKE ?) ORDER BY website ASC');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $searchTerm, SQLITE3_TEXT);
         $stmt->bindValue(3, $searchTerm, SQLITE3_TEXT);
         $stmt->bindValue(4, $searchTerm, SQLITE3_TEXT);
+        $stmt->bindValue(5, $searchTerm, SQLITE3_TEXT);
+        $stmt->bindValue(6, $searchTerm, SQLITE3_TEXT);
         $result = $stmt->execute();
 
         $searchResults = [];
         while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $decrypted_password = Encryption::decrypt($row['encrypted_password'], $row['iv'], $this->encryptionKey);
+            $row['password'] = $decrypted_password !== false ? $decrypted_password : '[Decryption Failed]';
+            unset($row['encrypted_password']);
+            unset($row['iv']);
             $searchResults[] = $row;
         }
         return $searchResults;
     }
 }
 
-// Initialize classes
+// --- Initialize Classes ---
 $database = new Database();
 $user = new User($database);
-$notes = new Notes($database);
+$passwordManager = new PasswordManager($database); // Renamed from $notes
 
 // Initialize messages and errors
 $message = '';
 $error = '';
-$userNotes = []; 
+$userPasswords = []; // Renamed from $userNotes
 
-// Centralized Session Validation Check
+// --- Centralized Session Validation Check ---
 // This must run before any other logic that relies on $_SESSION['user_id']
 if (isset($_SESSION['user_id'])) {
     $stmt = $database->getConnection()->prepare('SELECT session_version FROM users WHERE id = ?');
@@ -277,50 +584,53 @@ if (isset($_SESSION['user_id'])) {
         header('Location: ' . $_SERVER['PHP_SELF'] . '?message=' . urlencode('You have been logged out from all devices due to a password change or forced logout. Please log in again.'));
         exit;
     }
+    // Set the encryption key for the password manager after session validation
+    $passwordManager->setEncryptionKey($_SESSION['master_encryption_key']);
 }
 
-// Handle POST requests
+// --- Handle POST Requests ---
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
         switch ($_POST['action']) {
             case 'register':
                 $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
                 $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
-                $password = $_POST['password']; 
+                $password = $_POST['password']; // Master password
                 if ($user->register($username, $email, $password)) {
                     $message = 'Registration successful! Please login.';
                 } else {
                     $error = 'Registration failed. Username or email might already exist.';
                 }
                 break;
-                
+
             case 'login':
                 $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
-                $password = $_POST['password'];
-                $userData = $user->login($username, $password); 
+                $password = $_POST['password']; // Master password
+                $userData = $user->login($username, $password);
                 if ($userData) {
                     $_SESSION['user_id'] = $userData['id'];
                     $_SESSION['username'] = $userData['username'];
-                    header('Location: ' . $_SERVER['PHP_SELF']); 
+                    // Encryption key is already set by the User->login method
+                    header('Location: ' . $_SERVER['PHP_SELF']);
                     exit;
                 } else {
                     $error = 'Invalid credentials.';
                 }
                 break;
-                
+
             case 'logout':
                 session_destroy();
-                $_SESSION = array(); 
+                $_SESSION = array();
                 header('Location: ' . $_SERVER['PHP_SELF']);
                 exit;
                 break;
-                
-            case 'logout_all_devices': 
+
+            case 'logout_all_devices':
                 if (isset($_SESSION['user_id'])) {
                     $userId = $_SESSION['user_id'];
                     if ($user->incrementSessionVersion($userId)) {
                         session_destroy();
-                        $_SESSION = array(); 
+                        $_SESSION = array();
                         header('Location: ' . $_SERVER['PHP_SELF'] . '?message=' . urlencode('You have successfully logged out from all devices.'));
                         exit;
                     } else {
@@ -330,77 +640,91 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $error = 'You must be logged in to perform this action.';
                 }
                 break;
-                
-            case 'create_note':
+
+            case 'add_password': // Changed from create_note
                 if (isset($_SESSION['user_id'])) {
-                    $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
-                    $content = filter_input(INPUT_POST, 'content', FILTER_SANITIZE_STRING);
-                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: ''; 
-                    if ($notes->create($_SESSION['user_id'], $title, $content, $tags)) {
-                        $message = 'Note created successfully!';
+                    $website = filter_input(INPUT_POST, 'website', FILTER_SANITIZE_STRING);
+                    $username = filter_input(INPUT_POST, 'entry_username', FILTER_SANITIZE_STRING);
+                    $password = $_POST['entry_password']; // Actual password, not master
+                    $url = filter_input(INPUT_POST, 'url', FILTER_SANITIZE_URL);
+                    $notes = filter_input(INPUT_POST, 'notes', FILTER_SANITIZE_STRING);
+                    $category = filter_input(INPUT_POST, 'category', FILTER_SANITIZE_STRING) ?: 'General';
+
+                    if ($passwordManager->addPassword($_SESSION['user_id'], $website, $username, $password, $url, $notes, $category)) {
+                        $message = 'Password entry added successfully!';
                     } else {
-                        $error = 'Failed to create note.';
+                        $error = 'Failed to add password entry. Ensure OpenSSL is enabled and your session is active.';
                     }
                 } else {
-                    $error = 'You must be logged in to create a note.';
+                    $error = 'You must be logged in to add a password entry.';
                 }
                 break;
-                
-            case 'update_note':
+
+            case 'update_password': // Changed from update_note
                 if (isset($_SESSION['user_id'])) {
-                    $noteId = filter_input(INPUT_POST, 'note_id', FILTER_SANITIZE_NUMBER_INT);
-                    $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
-                    $content = filter_input(INPUT_POST, 'content', FILTER_SANITIZE_STRING);
-                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: '';
-                    if ($notes->update($noteId, $_SESSION['user_id'], $title, $content, $tags)) {
-                        $message = 'Note updated successfully!';
+                    $passwordId = filter_input(INPUT_POST, 'password_id', FILTER_SANITIZE_NUMBER_INT);
+                    $website = filter_input(INPUT_POST, 'website', FILTER_SANITIZE_STRING);
+                    $username = filter_input(INPUT_POST, 'entry_username', FILTER_SANITIZE_STRING);
+                    $password = $_POST['entry_password']; // Actual password, not master
+                    $url = filter_input(INPUT_POST, 'url', FILTER_SANITIZE_URL);
+                    $notes = filter_input(INPUT_POST, 'notes', FILTER_SANITIZE_STRING);
+                    $category = filter_input(INPUT_POST, 'category', FILTER_SANITIZE_STRING) ?: 'General';
+
+                    $passwordId = (int)$passwordId;
+                    $userId = (int)$_SESSION['user_id'];
+
+                    if ($passwordManager->updatePassword($passwordId, $userId, $website, $username, $password, $url, $notes, $category)) {
+                        $message = 'Password entry updated successfully!';
+                        // Clear the edit GET parameter so form reverts to 'add' mode
+                        header('Location: ' . $_SERVER['PHP_SELF']);
+                        exit;
                     } else {
-                        $error = 'Failed to update note.';
+                        $error = 'Failed to update password entry. Check server logs for details or ensure OpenSSL is enabled.';
                     }
                 } else {
-                    $error = 'You must be logged in to update a note.';
+                    $error = 'You must be logged in to update a password entry.';
                 }
                 break;
-                
-            case 'delete_note':
+
+            case 'delete_password': // Changed from delete_note
                 if (isset($_SESSION['user_id'])) {
-                    $noteId = filter_input(INPUT_POST, 'note_id', FILTER_SANITIZE_NUMBER_INT);
-                    if ($notes->delete($noteId, $_SESSION['user_id'])) {
-                        $message = 'Note deleted successfully!';
+                    $passwordId = filter_input(INPUT_POST, 'password_id', FILTER_SANITIZE_NUMBER_INT);
+                    if ($passwordManager->deletePassword($passwordId, $_SESSION['user_id'])) {
+                        $message = 'Password entry deleted successfully!';
                     } else {
-                        $error = 'Failed to delete note.';
+                        $error = 'Failed to delete password entry.';
                     }
                 } else {
-                    $error = 'You must be logged in to delete a note.';
+                    $error = 'You must be logged in to delete a password entry.';
                 }
                 break;
-            
-            case 'search_notes':
+
+            case 'search_passwords': // Changed from search_notes
                 if (isset($_SESSION['user_id'])) {
                     $searchTerm = filter_input(INPUT_POST, 'search_term', FILTER_SANITIZE_STRING);
-                    $userNotes = $notes->searchNotes($_SESSION['user_id'], $searchTerm);
-                    if (empty($userNotes)) {
-                        $message = 'No notes found matching your search criteria.';
+                    $userPasswords = $passwordManager->searchPasswords($_SESSION['user_id'], $searchTerm);
+                    if (empty($userPasswords)) {
+                        $message = 'No password entries found matching your search criteria.';
                     } else {
                         $message = 'Search results for "' . htmlspecialchars($searchTerm) . '".';
                     }
                 } else {
-                    $error = 'You must be logged in to search notes.';
+                    $error = 'You must be logged in to search password entries.';
                 }
                 break;
 
-            case 'reset_password_from_login_page': 
+            case 'reset_password_from_login_page':
                 $identifier = filter_input(INPUT_POST, 'identifier', FILTER_SANITIZE_STRING);
-                $oldPassword = $_POST['old_password'];
-                $newPassword = $_POST['new_password'];
+                $oldPassword = $_POST['old_password']; // Current master password
+                $newPassword = $_POST['new_password']; // New master password
                 $confirmNewPassword = $_POST['confirm_new_password'];
 
                 if (empty($identifier) || empty($oldPassword) || empty($newPassword) || empty($confirmNewPassword)) {
                     $error = 'All fields are required.';
                 } elseif ($newPassword !== $confirmNewPassword) {
                     $error = 'New password and confirm password do not match.';
-                } elseif (strlen($newPassword) < 6) { 
-                    $error = 'New password must be at least 6 characters long.';
+                } elseif (strlen($newPassword) < 8) { // Increased minimum password length
+                    $error = 'New password must be at least 8 characters long.';
                 } else {
                     if ($user->resetPasswordFromLogin($identifier, $oldPassword, $newPassword)) {
                         $message = 'Password updated successfully! Please login with your new password.';
@@ -413,33 +737,71 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $error = 'Failed to update password. Please check your username/email and old password.';
                     }
                 }
+                // Always redirect after a password reset attempt on the login page
+                header('Location: ' . $_SERVER['PHP_SELF'] . ($message ? '?message=' . urlencode($message) : ($error ? '?error=' . urlencode($error) : '')));
+                exit;
+                break;
+
+            case 'change_master_password': // New action for logged-in users to change master password
+                if (isset($_SESSION['user_id'])) {
+                    $oldPassword = $_POST['current_master_password'];
+                    $newPassword = $_POST['new_master_password'];
+                    $confirmNewPassword = $_POST['confirm_new_master_password'];
+
+                    if (empty($oldPassword) || empty($newPassword) || empty($confirmNewPassword)) {
+                        $error = 'All fields are required for changing master password.';
+                    } elseif ($newPassword !== $confirmNewPassword) {
+                        $error = 'New master password and confirm new master password do not match.';
+                    } elseif (strlen($newPassword) < 8) {
+                        $error = 'New master password must be at least 8 characters long.';
+                    } else {
+                        if ($user->changePassword($_SESSION['user_id'], $oldPassword, $newPassword)) {
+                            $message = 'Master password changed successfully! All other sessions have been logged out.';
+                            // Session will be updated by user->changePassword and current session will remain active
+                            // with new encryption key.
+                        } else {
+                            $error = 'Failed to change master password. Please check your current master password.';
+                        }
+                    }
+                } else {
+                    $error = 'You must be logged in to change your master password.';
+                }
+                // IMP: Redirect after handling this POST request to prevent re-submission and clear form state
+                header('Location: ' . $_SERVER['PHP_SELF'] . ($message ? '?message=' . urlencode($message) : ($error ? '?error=' . urlencode($error) : '')));
+                exit;
                 break;
         }
     }
-    // After handling POST, redirect to prevent form re-submission on refresh
-    // Except for search and login-page password reset, which update displayed data/messages directly.
-    if (!isset($_POST['action']) || !in_array($_POST['action'], ['search_notes', 'reset_password_from_login_page'])) {
+    // Redirect to prevent form re-submission on refresh, unless it's a search
+    // The password change/reset actions now have their own redirects.
+    if (!isset($_POST['action']) || $_POST['action'] !== 'search_passwords') {
         header('Location: ' . $_SERVER['PHP_SELF'] . (isset($_GET['edit']) ? '?edit=' . $_GET['edit'] : ''));
         exit;
     }
 }
 
-// Get current note for editing (if 'edit' GET parameter is set)
-$editNote = null;
+// --- Fetch data for display ---
+// Get current password entry for editing (if 'edit' GET parameter is set)
+$editPasswordEntry = null;
 if (isset($_GET['edit']) && isset($_SESSION['user_id'])) {
-    $editNote = $notes->getNote($_GET['edit'], $_SESSION['user_id']);
+    $editPasswordEntry = $passwordManager->getPassword($_GET['edit'], $_SESSION['user_id']);
+    // Debugging: Output the data fetched for editing
+    // error_log("Password data fetched for editing: " . print_r($editPasswordEntry, true));
 }
 
-// Fetch user notes if not a search request
-if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
+// Fetch user passwords if not a search request or if coming from a redirect
+if (!isset($_POST['action']) || $_POST['action'] !== 'search_passwords') {
     if (isset($_SESSION['user_id'])) {
-        $userNotes = $notes->getUserNotes($_SESSION['user_id']);
+        $userPasswords = $passwordManager->getUserPasswords($_SESSION['user_id']);
     }
 }
 
-// Check for messages passed via GET (e.g., after logout all devices)
+// Check for messages passed via GET (e.g., after logout all devices, or password change/reset)
 if (isset($_GET['message'])) {
     $message = htmlspecialchars($_GET['message']);
+}
+if (isset($_GET['error'])) { // Also check for error messages from GET
+    $error = htmlspecialchars($_GET['error']);
 }
 
 ?>
@@ -449,10 +811,41 @@ if (isset($_GET['message'])) {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Notes App</title>
+    <title>Secure Password Manager</title>
     <!-- Font Awesome for icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
+    <!-- Google Fonts - Inter -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        /* CSS Variables for easy theming */
+        :root {
+            --primary-color: #667eea;
+            --primary-dark: #5a67d8;
+            --secondary-color: #6c757d;
+            --secondary-dark: #5a6268;
+            --danger-color: #e74c3c;
+            --danger-dark: #c0392b;
+            --success-color: #28a745;
+            --success-dark: #218838;
+            --warning-color: #f39c12;
+            --warning-dark: #e67e22;
+            --background-gradient-start: #4a00e0; /* Deeper purple */
+            --background-gradient-end: #8e2de2;   /* Vibrant purple */
+            --card-background: rgba(255, 255, 255, 0.98); /* Slightly less transparent */
+            --text-color-dark: #2a2a2a; /* Darker for better contrast */
+            --text-color-medium: #444;
+            --text-color-light: #666;
+            --border-color: #e1e8ed;
+            --input-border-color: #ccc;
+            --input-focus-shadow: rgba(102, 126, 234, 0.4); /* Softer primary glow */
+            --box-shadow-light: 0 4px 15px rgba(0,0,0,0.08); /* More pronounced */
+            --box-shadow-medium: 0 10px 30px rgba(0,0,0,0.15); /* More pronounced */
+            --box-shadow-strong: 0 25px 50px rgba(0,0,0,0.3); /* Stronger */
+            --border-radius-small: 8px;
+            --border-radius-medium: 12px; /* Slightly larger */
+            --border-radius-large: 20px; /* More rounded */
+        }
+
         /* General Reset & Base Styles */
         * {
             margin: 0;
@@ -461,95 +854,198 @@ if (isset($_GET['message'])) {
         }
 
         body {
-            font-family: 'Inter', sans-serif; /* Using Inter font */
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, var(--background-gradient-start) 0%, var(--background-gradient-end) 100%);
             min-height: 100vh;
             padding: 20px;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
+            color: var(--text-color-dark);
+            line-height: 1.6;
+            text-rendering: optimizeLegibility;
+            -webkit-font-smoothing: antialiased;
+            -moz-osx-font-smoothing: grayscale;
         }
 
         .container {
             max-width: 1200px;
             width: 100%;
             margin: 0 auto;
-            border-radius: 15px;
+            border-radius: var(--border-radius-large);
             overflow: hidden;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-            background: rgba(255, 255, 255, 0.9); /* Slightly transparent background for modern look */
+            box-shadow: var(--box-shadow-strong);
+            background: var(--card-background);
+            min-height: 80vh; /* Ensure container fills vertical space for better layout */
+            display: flex;
+            flex-direction: column;
+        }
+
+        h1, h2 {
+            color: var(--text-color-dark);
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: 700;
+        }
+        h2 {
+            font-size: 2.2rem; /* Larger font size */
+            letter-spacing: -0.5px;
         }
 
         /* Authentication Forms */
         .auth-container {
-            max-width: 450px; 
-            margin: 50px auto; 
+            max-width: 450px;
+            margin: 50px auto;
             background: white;
             padding: 40px;
-            border-radius: 15px;
-            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-            animation: fadeIn 0.5s ease-out; 
+            border-radius: var(--border-radius-large);
+            box-shadow: var(--box-shadow-medium);
+            animation: fadeIn 0.5s ease-out;
         }
 
         .auth-container h2 {
-            text-align: center;
-            color: #333;
             margin-bottom: 30px;
-            font-size: 28px;
-            font-weight: 700;
+            font-size: 2rem;
         }
 
         /* App Header */
         .app-header {
             background: white;
             padding: 20px 30px;
-            border-bottom: 1px solid #e1e8ed;
+            border-bottom: 1px solid var(--border-color);
             display: flex;
             justify-content: space-between;
             align-items: center;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-            border-radius: 15px 15px 0 0; 
-            margin-bottom: 20px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08); /* More depth */
+            border-radius: var(--border-radius-large) var(--border-radius-large) 0 0;
+            margin-bottom: 20px;
+            flex-wrap: wrap; /* Allow wrapping for responsiveness */
+            gap: 15px; /* Spacing between header elements */
         }
 
         .welcome {
-            color: #333;
-            font-size: 22px;
+            color: var(--text-color-dark);
+            font-size: 24px; /* Slightly larger */
             font-weight: 600;
         }
 
         .header-actions {
             display: flex;
-            gap: 10px;
-            flex-wrap: wrap; 
+            gap: 12px; /* Slightly more space */
+            flex-wrap: wrap;
             justify-content: flex-end;
+            align-items: center;
         }
 
-        .logout-btn, .logout-all-btn {
-            background: #e74c3c;
+        /* Generic Button Styles */
+        .btn {
+            background: var(--primary-color);
+            background-image: linear-gradient(135deg, var(--primary-color) 0%, var(--primary-dark) 100%); /* Subtle gradient */
             color: white;
             border: none;
-            padding: 10px 20px;
-            border-radius: 8px;
+            padding: 12px 28px; /* More padding */
+            border-radius: var(--border-radius-medium);
             cursor: pointer;
-            font-weight: 500;
-            transition: background 0.3s ease, transform 0.2s ease;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-            display: inline-flex; 
-            align-items: center; 
-            gap: 8px; 
+            font-size: 16px;
+            font-weight: 600; /* Bolder font */
+            transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1); /* Smoother transition */
+            box-shadow: 0 6px 15px rgba(0,0,0,0.15); /* More pronounced shadow */
+            display: inline-flex; /* For icons */
+            align-items: center;
+            justify-content: center; /* Center content */
+            gap: 10px; /* More spacing between text and icon */
+            text-decoration: none; /* For anchor tags styled as buttons */
+            position: relative;
+            overflow: hidden;
         }
 
-        .logout-btn:hover, .logout-all-btn:hover {
-            background: #c0392b;
-            transform: translateY(-2px);
+        .btn:hover {
+            background-image: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-color) 100%); /* Reverse gradient on hover */
+            transform: translateY(-3px); /* More noticeable lift */
+            box-shadow: 0 10px 25px rgba(0,0,0,0.25); /* Stronger shadow on hover */
+        }
+        .btn:active {
+            transform: translateY(0);
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            background-image: linear-gradient(135deg, var(--primary-dark) 0%, var(--primary-dark) 100%);
+        }
+
+        /* Ripple effect for buttons */
+        .btn::after {
+            content: '';
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            top: 0;
+            left: 0;
+            pointer-events: none;
+            background-image: radial-gradient(circle, #fff 10%, transparent 10.01%);
+            background-repeat: no-repeat;
+            background-position: 50%;
+            transform: scale(10, 10);
+            opacity: 0;
+            transition: transform 0.5s, opacity 1s;
+        }
+        .btn:not(.no-ripple):active::after {
+            transform: scale(0, 0);
+            opacity: 0.2;
+            transition: 0s;
+        }
+
+        .btn-secondary {
+            background: var(--secondary-color);
+            background-image: linear-gradient(135deg, var(--secondary-color) 0%, var(--secondary-dark) 100%);
+        }
+        .btn-secondary:hover {
+            background-image: linear-gradient(135deg, var(--secondary-dark) 0%, var(--secondary-color) 100%);
+        }
+        .btn-secondary:active {
+            background-image: linear-gradient(135deg, var(--secondary-dark) 0%, var(--secondary-dark) 100%);
+        }
+
+        .btn-danger {
+            background: var(--danger-color);
+            background-image: linear-gradient(135deg, var(--danger-color) 0%, var(--danger-dark) 100%);
+        }
+        .btn-danger:hover {
+            background-image: linear-gradient(135deg, var(--danger-dark) 0%, var(--danger-color) 100%);
+        }
+        .btn-danger:active {
+            background-image: linear-gradient(135deg, var(--danger-dark) 0%, var(--danger-dark) 100%);
+        }
+
+        .btn-success {
+            background: var(--success-color);
+            background-image: linear-gradient(135deg, var(--success-color) 0%, var(--success-dark) 100%);
+        }
+        .btn-success:hover {
+            background-image: linear-gradient(135deg, var(--success-dark) 0%, var(--success-color) 100%);
+        }
+        .btn-success:active {
+            background-image: linear-gradient(135deg, var(--success-dark) 0%, var(--success-dark) 100%);
+        }
+
+        .logout-btn {
+            background: var(--danger-color);
+            background-image: linear-gradient(135deg, var(--danger-color) 0%, var(--danger-dark) 100%);
+        }
+        .logout-btn:hover {
+            background-image: linear-gradient(135deg, var(--danger-dark) 0%, var(--danger-color) 100%);
         }
         .logout-all-btn {
-            background: #f39c12; 
+            background: var(--warning-color);
+            background-image: linear-gradient(135deg, var(--warning-color) 0%, var(--warning-dark) 100%);
         }
         .logout-all-btn:hover {
-            background: #e67e22;
+            background-image: linear-gradient(135deg, var(--warning-dark) 0%, var(--warning-color) 100%);
+        }
+        .change-master-password-btn {
+            background: var(--primary-color);
+            background-image: linear-gradient(135deg, #4CAF50 0%, #388E3C 100%); /* Green for change password */
+        }
+        .change-master-password-btn:hover {
+            background-image: linear-gradient(135deg, #388E3C 0%, #4CAF50 100%);
         }
 
 
@@ -557,285 +1053,386 @@ if (isset($_GET['message'])) {
         .main-content {
             display: grid;
             grid-template-columns: 1fr 2fr;
-            gap: 30px;
+            gap: 40px; /* Increased gap */
             padding: 30px;
-            background: white; 
-            border-radius: 0 0 15px 15px; 
+            background: white;
+            border-radius: 0 0 var(--border-radius-large) var(--border-radius-large);
+            flex-grow: 1; /* Allow content to grow and fill space */
         }
 
-        .note-form, .notes-list { 
-            background: #fdfdfd; 
-            padding: 30px;
-            border-radius: 15px;
-            box-shadow: 0 8px 20px rgba(0,0,0,0.08);
-            height: fit-content;
+        .password-form, .password-list {
+            background: #fdfdfd;
+            padding: 35px; /* More padding */
+            border-radius: var(--border-radius-large);
+            box-shadow: var(--box-shadow-medium);
+            height: fit-content; /* Adjust height dynamically */
+            display: flex; /* Use flexbox for internal layout */
+            flex-direction: column;
+            border: 1px solid #f0f0f0; /* Subtle border */
         }
 
-        .notes-list {
-            min-height: 400px; 
+        .password-list {
+            min-height: 400px;
+            flex-grow: 1; /* Allow password list to take available space */
         }
-        
+
         /* Form Elements */
         .form-group {
-            margin-bottom: 20px;
+            margin-bottom: 25px; /* More space between form groups */
         }
 
         .form-group label {
             display: block;
-            margin-bottom: 8px;
-            color: #555;
+            margin-bottom: 10px; /* More space below label */
+            color: var(--text-color-medium);
             font-weight: 600;
-            font-size: 15px;
+            font-size: 16px; /* Slightly larger label font */
         }
 
         .form-group input,
-        .form-group textarea {
+        .form-group textarea,
+        .form-group select {
             width: 100%;
-            padding: 12px;
-            border: 2px solid #e1e8ed;
-            border-radius: 8px;
-            font-size: 16px;
-            color: #333;
+            padding: 14px; /* More padding */
+            border: 1px solid var(--input-border-color); /* Lighter border */
+            border-radius: var(--border-radius-small);
+            font-size: 17px; /* Slightly larger font */
+            color: var(--text-color-dark);
+            background-color: #fcfcfc; /* Off-white background */
             transition: border-color 0.3s ease, box-shadow 0.3s ease;
         }
 
         .form-group input:focus,
-        .form-group textarea:focus {
+        .form-group textarea:focus,
+        .form-group select:focus {
             outline: none;
-            border-color: #667eea;
-            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 4px var(--input-focus-shadow); /* More prominent, softer shadow */
         }
 
         .form-group textarea {
-            height: 150px;
+            height: 120px;
             resize: vertical;
         }
 
-        /* Buttons */
-        .btn {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 12px 24px;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-            font-weight: 500;
-            transition: background 0.3s ease, transform 0.2s ease, box-shadow 0.2s ease;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        /* Input validation feedback */
+        .form-group input:valid:not(:placeholder-shown),
+        .form-group textarea:valid:not(:placeholder-shown),
+        .form-group select:valid:not([value=""]):not(:focus) {
+            border-color: var(--success-color);
         }
-
-        .btn:hover {
-            background: #5a67d8;
-            transform: translateY(-2px);
-            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
+        .form-group input:invalid:not(:placeholder-shown),
+        .form-group textarea:invalid:not(:placeholder-shown),
+        .form-group select:invalid:not([value=""]):not(:focus) {
+            border-color: var(--danger-color);
+            box-shadow: 0 0 0 4px rgba(231, 76, 60, 0.2); /* Red shadow for invalid */
         }
-
-        .btn-secondary {
-            background: #6c757d;
-        }
-
-        .btn-secondary:hover {
-            background: #5a6268;
-        }
-
-        .btn-danger {
-            background: #e74c3c;
-        }
-
-        .btn-danger:hover {
-            background: #c0392b;
-        }
-        .btn-inline-flex {
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        /* Note Cards */
-        .note-card {
-            background: #ffffff;
-            padding: 20px;
-            margin-bottom: 20px;
-            border-radius: 10px;
-            border-left: 5px solid #667eea; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
-            transition: transform 0.2s ease;
-        }
-
-        .note-card:hover {
-            transform: translateY(-3px);
-        }
-
-        .note-title {
-            font-size: 20px;
-            font-weight: 700;
-            color: #333;
-            margin-bottom: 10px;
-        }
-
-        .note-content {
-            color: #666;
-            margin-bottom: 15px;
-            line-height: 1.6;
-            font-size: 15px;
-            white-space: pre-wrap; 
-            word-wrap: break-word; 
-        }
-        
-        .note-tags {
+        .form-group .validation-message {
+            color: var(--danger-color);
             font-size: 13px;
-            color: #4a5568;
-            margin-bottom: 10px;
+            margin-top: 8px; /* More space */
+            display: none; /* Hidden by default, shown by JS */
+            font-weight: 500;
+        }
+        .form-group input:invalid:not(:placeholder-shown) + .validation-message,
+        .form-group textarea:invalid:not(:placeholder-shown) + .validation-message,
+        .form-group select:invalid:not([value=""]):not(:focus) + .validation-message {
+            display: block;
+            animation: fadeIn 0.3s ease-out; /* Fade in validation message */
         }
 
-        .note-tag {
-            background: #e2e8f0;
-            color: #4a5568;
-            padding: 4px 8px;
-            border-radius: 5px;
-            margin-right: 5px;
-            display: inline-block;
-            margin-bottom: 5px;
+
+        /* Password Input with Toggle and Generator */
+        .password-input-group {
+            display: flex;
+            align-items: stretch;
+            gap: 10px; /* Increased gap */
         }
 
-        .note-meta {
-            font-size: 12px;
+        .password-input-group input {
+            flex-grow: 1;
+        }
+
+        .password-input-group .btn {
+            padding: 10px 18px; /* Adjusted padding */
+            font-size: 15px; /* Slightly larger font */
+            white-space: nowrap;
+        }
+
+        /* Password Entry Cards */
+        .password-entry-card {
+            background: #ffffff;
+            padding: 25px; /* More padding */
+            margin-bottom: 25px; /* More space */
+            border-radius: var(--border-radius-medium);
+            border-left: 6px solid var(--primary-color); /* Thicker border */
+            box-shadow: var(--box-shadow-light);
+            transition: transform 0.2s ease, box-shadow 0.2s ease;
+        }
+
+        .password-entry-card:hover {
+            transform: translateY(-4px); /* More noticeable lift */
+            box-shadow: 0 8px 20px rgba(0,0,0,0.12); /* Stronger shadow on hover */
+        }
+
+        .entry-title {
+            font-size: 22px; /* Slightly larger */
+            font-weight: 700;
+            color: var(--text-color-dark);
+            margin-bottom: 12px; /* More space */
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .entry-title .category-tag {
+            font-size: 13px;
+            background: #e0f2f7; /* Very light blue */
+            color: #2196F3; /* Darker blue text */
+            padding: 5px 12px; /* More padding */
+            border-radius: 20px; /* Pill shape */
+            font-weight: 600;
+            margin-left: 15px; /* More space */
+            border: 1px solid rgba(33,150,243,0.2); /* Subtle border */
+        }
+
+        .entry-detail-row {
+            display: flex;
+            align-items: center; /* Center vertically */
+            margin-bottom: 10px; /* More space */
+            font-size: 16px; /* Slightly larger */
+            color: var(--text-color-medium);
+            flex-wrap: wrap;
+            gap: 8px; /* More space */
+        }
+        .entry-detail-row i {
+            margin-right: 8px;
+            color: var(--primary-color);
+            width: 22px; /* Fixed width for icons */
+            text-align: center;
+            font-size: 1.1em; /* Slightly larger icon */
+        }
+        .entry-detail-row strong {
+            margin-right: 8px;
+            color: var(--text-color-dark);
+            flex-shrink: 0;
+        }
+        .entry-detail-row .copy-btn {
+            background: #f0f4fa; /* Light background for copy button */
+            border: none;
+            color: var(--primary-color);
+            cursor: pointer;
+            font-size: 14px;
+            margin-left: 10px;
+            padding: 6px 10px;
+            border-radius: var(--border-radius-small);
+            transition: background 0.2s ease, color 0.2s ease;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.05); /* Subtle shadow */
+        }
+        .entry-detail-row .copy-btn:hover {
+            background: var(--primary-color);
+            color: white;
+        }
+        .entry-detail-row .copy-btn i {
+            margin-right: 0;
+            color: inherit; /* Inherit color from button */
+        }
+
+        .entry-password-display {
+            font-family: 'Fira Code', 'Courier New', Courier, monospace; /* More modern monospace font */
+            background-color: #eef2f7; /* Slightly darker light background */
+            padding: 10px 15px; /* More padding */
+            border-radius: var(--border-radius-small);
+            word-break: break-all;
+            white-space: normal;
+            transition: filter 0.3s ease;
+            flex-grow: 1; /* Allow it to take more space */
+            font-weight: 500;
+            color: #333;
+        }
+        .entry-password-hidden {
+            filter: blur(5px); /* More blur effect */
+            user-select: none; /* Prevent selection while blurred */
+            pointer-events: none; /* Prevent copying text directly from blurred content */
+        }
+
+        .entry-notes, .entry-url {
+            color: var(--text-color-light);
+            margin-bottom: 18px; /* More space */
+            line-height: 1.7;
+            font-size: 15px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            background-color: #f9f9f9; /* Slight background for notes */
+            padding: 10px 15px;
+            border-radius: var(--border-radius-small);
+            border: 1px dashed #eee;
+        }
+        .entry-notes i, .entry-url i {
+            margin-right: 5px; /* Adjust icon spacing for notes/URL block */
             color: #999;
-            margin-bottom: 15px;
-            border-top: 1px solid #eee;
-            padding-top: 10px;
-            margin-top: 15px;
         }
 
-        .note-actions {
+        .entry-meta {
+            font-size: 13px; /* Slightly larger */
+            color: #888;
+            margin-top: 20px; /* More space */
+            border-top: 1px solid #e8e8e8; /* Lighter border */
+            padding-top: 15px;
+            text-align: right; /* Align to right */
+        }
+
+        .entry-actions {
             display: flex;
             gap: 10px;
-            flex-wrap: wrap; 
+            flex-wrap: wrap;
+            margin-top: 20px; /* More space */
+            justify-content: flex-end; /* Align buttons to the right */
         }
 
-        .note-actions button, .note-actions a.btn {
-            padding: 8px 15px;
-            font-size: 14px;
-            border-radius: 6px;
+        .entry-actions button, .entry-actions a.btn {
+            padding: 9px 18px; /* Larger buttons */
+            font-size: 15px;
+            border-radius: 8px; /* More rounded */
+            box-shadow: 0 4px 10px rgba(0,0,0,0.1); /* Subtle shadow */
+        }
+        .entry-actions button:hover, .entry-actions a.btn:hover {
+            box-shadow: 0 6px 15px rgba(0,0,0,0.15);
         }
 
         /* Messages */
         .message {
-            padding: 15px 25px;
-            margin-bottom: 20px;
-            border-radius: 8px;
+            padding: 18px 30px; /* More padding */
+            margin-bottom: 25px; /* More space */
+            border-radius: var(--border-radius-medium);
             font-weight: 500;
-            opacity: 0; 
-            animation: fadeIn 0.5s ease-out forwards;
+            opacity: 0;
+            animation: fadeIn 0.5s cubic-bezier(0.25, 0.8, 0.25, 1) forwards;
+            position: relative;
+            overflow: hidden;
+            border-left: 6px solid; /* For a stronger visual cue */
         }
 
         .message.success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
+            background: #e6ffed; /* Lighter green */
+            color: #1a5724; /* Darker green text */
+            border-color: var(--success-color);
         }
 
         .message.error {
-            background: #f8d7da;
+            background: #ffe6e6; /* Lighter red */
             color: #721c24;
-            border: 1px solid #f5c6cb;
+            border-color: var(--danger-color);
         }
 
         /* Auth Toggle */
         .auth-toggle {
             text-align: center;
-            margin-top: 25px;
+            margin-top: 30px; /* More space */
             display: flex;
             justify-content: center;
-            gap: 15px;
+            gap: 20px; /* More space */
             flex-wrap: wrap;
         }
 
         .auth-toggle a {
-            color: #667eea;
+            color: var(--primary-color);
             text-decoration: none;
             font-weight: 600;
-            transition: color 0.3s ease;
+            transition: color 0.3s ease, text-decoration 0.3s ease;
         }
 
         .auth-toggle a:hover {
-            color: #5a67d8;
+            color: var(--primary-dark);
             text-decoration: underline;
-        }
-
-        h1, h2 {
-            color: #333;
-            margin-bottom: 20px;
-            text-align: center;
         }
 
         /* Search Bar */
         .search-bar {
-            margin-bottom: 30px;
+            margin-bottom: 35px; /* More space */
             display: flex;
-            gap: 10px;
+            gap: 12px; /* More space */
+            flex-wrap: wrap;
         }
 
         .search-bar input {
             flex-grow: 1;
-            padding: 12px;
-            border: 2px solid #e1e8ed;
-            border-radius: 8px;
-            font-size: 16px;
-            transition: border-color 0.3s;
+            padding: 14px;
+            border: 1px solid var(--input-border-color);
+            border-radius: var(--border-radius-small);
+            font-size: 17px;
+            transition: border-color 0.3s, box-shadow 0.3s;
+            background-color: #fcfcfc;
         }
 
         .search-bar input:focus {
             outline: none;
-            border-color: #667eea;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 4px var(--input-focus-shadow);
         }
 
-        /* Custom Modal for Confirmation */
+        /* Custom Modal for Confirmation / Change Master Password */
         .modal {
-            display: none; 
-            position: fixed; 
-            z-index: 1000; 
+            position: fixed;
+            z-index: 1000;
             left: 0;
             top: 0;
-            width: 100%; 
-            height: 100%; 
-            overflow: auto; 
-            background-color: rgba(0,0,0,0.5); 
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.6); /* Darker overlay */
             display: flex;
             align-items: center;
             justify-content: center;
+            opacity: 0;
+            visibility: hidden;
+            transition: opacity 0.3s ease, visibility 0.3s ease;
+        }
+
+        .modal.is-visible {
+            opacity: 1;
+            visibility: visible;
         }
 
         .modal-content {
             background-color: #fefefe;
-            margin: auto;
-            padding: 30px;
-            border: 1px solid #888;
-            border-radius: 15px;
+            padding: 40px; /* More padding */
+            border: 1px solid #ddd;
+            border-radius: var(--border-radius-large);
             width: 90%;
-            max-width: 400px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            max-width: 550px; /* Larger max-width */
+            box-shadow: 0 15px 40px rgba(0,0,0,0.25); /* Stronger shadow */
             text-align: center;
-            animation: zoomIn 0.3s ease-out;
+            display: flex;
+            flex-direction: column;
+            gap: 25px; /* More space */
+            transform: translateY(-30px); /* Initial offset for pop-in */
+            transition: transform 0.3s cubic-bezier(0.25, 0.8, 0.25, 1), opacity 0.3s ease;
+            opacity: 0;
+        }
+
+        .modal.is-visible .modal-content {
+            opacity: 1;
+            transform: translateY(0);
         }
 
         .modal-content h3 {
-            margin-bottom: 20px;
-            color: #333;
-            font-size: 24px;
+            margin-bottom: 15px; /* More space */
+            color: var(--text-color-dark);
+            font-size: 28px;
+            font-weight: 700;
         }
 
         .modal-content p {
-            margin-bottom: 30px;
-            color: #666;
-            font-size: 16px;
+            margin-bottom: 25px; /* More space */
+            color: var(--text-color-light);
+            font-size: 17px;
         }
 
         .modal-buttons {
             display: flex;
             justify-content: center;
             gap: 15px;
+            flex-wrap: wrap; /* Ensure buttons wrap on small screens */
         }
 
         /* Animations */
@@ -852,29 +1449,40 @@ if (isset($_GET['message'])) {
         /* Responsive Design */
         @media (max-width: 992px) {
             .main-content {
-                grid-template-columns: 1fr; 
+                grid-template-columns: 1fr;
                 padding: 20px;
+                gap: 30px;
             }
             .app-header {
                 flex-direction: column;
                 gap: 15px;
                 padding: 15px;
-                border-radius: 10px 10px 0 0;
+                border-radius: var(--border-radius-medium) var(--border-radius-medium) 0 0;
             }
             .welcome {
-                font-size: 20px;
+                font-size: 22px;
                 text-align: center;
             }
             .header-actions {
                 width: 100%;
                 justify-content: center;
             }
-            .logout-btn, .logout-all-btn {
-                flex-grow: 1; 
+            .logout-btn, .logout-all-btn, .change-master-password-btn {
+                flex-grow: 1;
+                max-width: 280px; /* Limit width on smaller screens */
             }
             .search-bar {
                 flex-direction: column;
                 gap: 10px;
+            }
+            .entry-title {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+            }
+            .entry-title .category-tag {
+                margin-left: 0;
+                margin-top: 5px;
             }
         }
 
@@ -883,36 +1491,67 @@ if (isset($_GET['message'])) {
                 padding: 15px;
             }
             .container {
-                border-radius: 10px;
+                border-radius: var(--border-radius-medium);
             }
             .auth-container {
                 margin: 30px auto;
                 padding: 30px;
-                border-radius: 10px;
+                border-radius: var(--border-radius-medium);
             }
             .main-content {
                 padding: 15px;
-                border-radius: 0 0 10px 10px;
+                border-radius: 0 0 var(--border-radius-medium) var(--border-radius-medium);
             }
-            .note-form, .notes-list {
+            .password-form, .password-list {
+                padding: 25px;
+                border-radius: var(--border-radius-medium);
+            }
+            .password-entry-card {
                 padding: 20px;
-                border-radius: 10px;
+                border-radius: var(--border-radius-small);
             }
-            .note-card {
-                padding: 15px;
-                border-radius: 8px;
+            .form-group input, .form-group textarea, .form-group select, .btn {
+                padding: 12px;
+                font-size: 16px;
             }
-            .form-group input, .form-group textarea, .btn {
-                padding: 10px;
-                font-size: 15px;
-            }
-            .note-actions button, .note-actions a.btn {
-                font-size: 13px;
-                padding: 6px 10px;
+            .entry-actions button, .entry-actions a.btn {
+                font-size: 14px;
+                padding: 8px 15px;
             }
             .auth-toggle {
                 flex-direction: column;
                 gap: 10px;
+            }
+            .password-input-group {
+                flex-direction: column;
+            }
+            .password-input-group .btn {
+                width: 100%;
+            }
+            .entry-detail-row {
+                flex-direction: column; /* Stack on very small screens for clarity */
+                align-items: flex-start;
+                gap: 3px;
+            }
+            .entry-detail-row strong {
+                width: auto;
+            }
+            .entry-detail-row .copy-btn {
+                margin-left: 0; /* Reset margin */
+                margin-top: 5px;
+                align-self: flex-end; /* Align copy button to the right of its row */
+            }
+        }
+        @media (max-width: 480px) {
+            .btn {
+                padding: 10px 20px;
+                font-size: 15px;
+            }
+            .modal-content {
+                padding: 25px;
+            }
+            .auth-container {
+                padding: 25px;
             }
         }
     </style>
@@ -921,225 +1560,319 @@ if (isset($_GET['message'])) {
     <div class="container">
         <?php if (!isset($_SESSION['user_id'])): ?>
             <!-- Authentication Forms -->
-            <div class="auth-container">
+            <div class="auth-container" role="main">
                 <?php if ($message): ?>
-                    <div class="message success"><?php echo htmlspecialchars($message); ?></div>
+                    <div class="message success" role="alert" aria-live="polite"><?php echo htmlspecialchars($message); ?></div>
                 <?php endif; ?>
-                
+
                 <?php if ($error): ?>
-                    <div class="message error"><?php echo htmlspecialchars($error); ?></div>
+                    <div class="message error" role="alert" aria-live="assertive"><?php echo htmlspecialchars($error); ?></div>
                 <?php endif; ?>
 
                 <div id="login-form">
-                    <h2>Login</h2>
-                    <form method="POST">
+                    <h2 id="login-heading">Login to Password Manager</h2>
+                    <form method="POST" aria-labelledby="login-heading">
                         <input type="hidden" name="action" value="login">
                         <div class="form-group">
                             <label for="login-username">Username or Email:</label>
-                            <input type="text" id="login-username" name="username" required autocomplete="username">
+                            <input type="text" id="login-username" name="username" required autocomplete="username" aria-required="true" placeholder="Enter your username or email">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
-                            <label for="login-password">Password:</label>
-                            <input type="password" id="login-password" name="password" required autocomplete="current-password">
+                            <label for="login-password">Master Password:</label>
+                            <input type="password" id="login-password" name="password" required autocomplete="current-password" aria-required="true" placeholder="Enter your master password">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
-                        <button type="submit" class="btn">Login</button>
+                        <button type="submit" class="btn" aria-label="Login"><i class="fas fa-sign-in-alt"></i> Login</button>
                     </form>
-                    <div class="auth-toggle">
-                        <a href="#" onclick="toggleForm('register')">Don't have an account? Sign Up</a>
-                        <a href="#" onclick="toggleForm('forgot_password')">Forgot Password?</a>
+                    <div class="auth-toggle" role="navigation" aria-label="Authentication Options">
+                        <a href="#" onclick="toggleForm('register')" role="link">Don't have an account? Sign Up</a>
+                        <a href="#" onclick="toggleForm('forgot_password')" role="link">Forgot Master Password?</a>
                     </div>
                 </div>
 
                 <div id="register-form" style="display: none;">
-                    <h2>Sign Up</h2>
-                    <form method="POST">
+                    <h2 id="register-heading">Register for Secure Access</h2>
+                    <form method="POST" aria-labelledby="register-heading">
                         <input type="hidden" name="action" value="register">
                         <div class="form-group">
                             <label for="reg-username">Username:</label>
-                            <input type="text" id="reg-username" name="username" required autocomplete="new-username">
+                            <input type="text" id="reg-username" name="username" required autocomplete="new-username" aria-required="true" placeholder="Choose a username">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
                             <label for="reg-email">Email:</label>
-                            <input type="email" id="reg-email" name="email" required autocomplete="email">
+                            <input type="email" id="reg-email" name="email" required autocomplete="email" aria-required="true" placeholder="Enter your email address">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
-                            <label for="reg-password">Password:</label>
-                            <input type="password" id="reg-password" name="password" required autocomplete="new-password">
+                            <label for="reg-password">Master Password:</label>
+                            <input type="password" id="reg-password" name="password" required autocomplete="new-password" aria-required="true" placeholder="Create a strong master password">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
-                        <button type="submit" class="btn">Sign Up</button>
+                        <button type="submit" class="btn" aria-label="Sign Up"><i class="fas fa-user-plus"></i> Sign Up</button>
                     </form>
-                    <div class="auth-toggle">
-                        <a href="#" onclick="toggleForm('login')">Already have an account? Login</a>
-                        <a href="#" onclick="toggleForm('forgot_password')">Forgot Password?</a>
+                    <div class="auth-toggle" role="navigation" aria-label="Authentication Options">
+                        <a href="#" onclick="toggleForm('login')" role="link">Already have an account? Login</a>
+                        <a href="#" onclick="toggleForm('forgot_password')" role="link">Forgot Master Password?</a>
                     </div>
                 </div>
 
                 <div id="forgot-password-form" style="display: none;">
-                    <h2>Reset Password</h2>
-                    <p style="text-align: center; color: #777; margin-bottom: 25px;">To reset your password, please enter your username or email, your old password, and your new password.</p>
-                    <form method="POST">
+                    <h2 id="forgot-password-heading">Reset Master Password</h2>
+                    <p style="text-align: center; color: var(--text-color-light); margin-bottom: 25px;">To reset your master password, please enter your username or email, your *old* master password, and your *new* master password.</p>
+                    <form method="POST" aria-labelledby="forgot-password-heading">
                         <input type="hidden" name="action" value="reset_password_from_login_page">
                         <div class="form-group">
                             <label for="forgot-identifier">Username or Email:</label>
-                            <input type="text" id="forgot-identifier" name="identifier" required autocomplete="username">
+                            <input type="text" id="forgot-identifier" name="identifier" required autocomplete="username" aria-required="true" placeholder="Your username or email">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
-                            <label for="forgot-old-password">Old Password:</label>
-                            <input type="password" id="forgot-old-password" name="old_password" required autocomplete="current-password">
+                            <label for="forgot-old-password">Old Master Password:</label>
+                            <input type="password" id="forgot-old-password" name="old_password" required autocomplete="current-password" aria-required="true" placeholder="Your current master password">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
-                            <label for="forgot-new-password">New Password:</label>
-                            <input type="password" id="forgot-new-password" name="new_password" required autocomplete="new-password">
+                            <label for="forgot-new-password">New Master Password:</label>
+                            <input type="password" id="forgot-new-password" name="new_password" required autocomplete="new-password" aria-required="true" placeholder="Choose a new master password">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div class="form-group">
-                            <label for="forgot-confirm-new-password">Confirm New Password:</label>
-                            <input type="password" id="forgot-confirm-new-password" name="confirm_new_password" required autocomplete="new-password">
+                            <label for="forgot-confirm-new-password">Confirm New Master Password:</label>
+                            <input type="password" id="forgot-confirm-new-password" name="confirm_new_password" required autocomplete="new-password" aria-required="true" placeholder="Confirm your new master password">
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
-                        <button type="submit" class="btn"><i class="fas fa-key"></i> Reset Password</button>
+                        <button type="submit" class="btn btn-inline-flex" aria-label="Reset Password"><i class="fas fa-key"></i> Reset Password</button>
                     </form>
-                    <div class="auth-toggle">
-                        <a href="#" onclick="toggleForm('login')">Back to Login</a>
-                        <a href="#" onclick="toggleForm('register')">Sign Up</a>
+                    <div class="auth-toggle" role="navigation" aria-label="Authentication Options">
+                        <a href="#" onclick="toggleForm('login')" role="link">Back to Login</a>
+                        <a href="#" onclick="toggleForm('register')" role="link">Sign Up</a>
                     </div>
                 </div>
             </div>
 
         <?php else: ?>
             <!-- Main Application -->
-            <div class="app-header">
-                <div class="welcome">Welcome, <?php echo htmlspecialchars($_SESSION['username']); ?>!</div>
-                <div class="header-actions">
-                    <form method="POST" style="display: inline;">
+            <header class="app-header" role="banner">
+                <div class="welcome" aria-label="Welcome message">Welcome, <?php echo htmlspecialchars($_SESSION['username']); ?>!</div>
+                <div class="header-actions" role="group" aria-label="Account Actions">
+                    <button type="button" class="change-master-password-btn" onclick="showChangeMasterPasswordModal()" aria-label="Change Master Password">
+                        <i class="fas fa-user-shield"></i> Change Master Password
+                    </button>
+                    <form method="POST" style="display: inline;" aria-label="Logout from all devices form">
                         <input type="hidden" name="action" value="logout_all_devices">
                         <button type="submit" class="logout-all-btn"><i class="fas fa-sign-out-alt"></i> Logout All Devices</button>
                     </form>
-                    <form method="POST" style="display: inline;">
+                    <form method="POST" style="display: inline;" aria-label="Logout form">
                         <input type="hidden" name="action" value="logout">
                         <button type="submit" class="logout-btn"><i class="fas fa-power-off"></i> Logout</button>
                     </form>
                 </div>
-            </div>
+            </header>
 
-            <div class="main-content">
+            <main class="main-content" role="main">
                 <!-- Message Display Area -->
                 <div style="grid-column: 1 / -1;">
                     <?php if ($message): ?>
-                        <div class="message success"><?php echo htmlspecialchars($message); ?></div>
+                        <div class="message success" role="alert" aria-live="polite"><?php echo htmlspecialchars($message); ?></div>
                     <?php endif; ?>
-                    
+
                     <?php if ($error): ?>
-                        <div class="message error"><?php echo htmlspecialchars($error); ?></div>
+                        <div class="message error" role="alert" aria-live="assertive"><?php echo htmlspecialchars($error); ?></div>
                     <?php endif; ?>
                 </div>
 
-                <!-- Note Form -->
-                <div class="note-form">
-                    <h2><?php echo $editNote ? 'Edit Note' : 'Create New Note'; ?></h2>
+                <!-- Password Entry Form -->
+                <section class="password-form" aria-labelledby="password-form-heading">
+                    <h2 id="password-form-heading"><?php echo $editPasswordEntry ? 'Edit Password Entry' : 'Add New Password'; ?></h2>
                     <form method="POST">
-                        <input type="hidden" name="action" value="<?php echo $editNote ? 'update_note' : 'create_note'; ?>">
-                        <?php if ($editNote): ?>
-                            <input type="hidden" name="note_id" value="<?php echo htmlspecialchars($editNote['id']); ?>">
+                        <input type="hidden" name="action" value="<?php echo $editPasswordEntry ? 'update_password' : 'add_password'; ?>">
+                        <?php if ($editPasswordEntry): ?>
+                            <input type="hidden" name="password_id" value="<?php echo htmlspecialchars($editPasswordEntry['id']); ?>">
                         <?php endif; ?>
-                        
+
                         <div class="form-group">
-                            <label for="note-title">Title:</label>
-                            <input type="text" id="note-title" name="title" value="<?php echo $editNote ? htmlspecialchars($editNote['title']) : ''; ?>" required>
+                            <label for="website">Website/Service:</label>
+                            <input type="text" id="website" name="website" value="<?php echo $editPasswordEntry ? htmlspecialchars($editPasswordEntry['website']) : ''; ?>" required autocomplete="organization" aria-required="true" placeholder="e.g., Google, Facebook">
+                            <span class="validation-message" aria-live="polite">Website/Service is required.</span>
                         </div>
                         <div class="form-group">
-                            <label for="note-content">Content:</label>
-                            <textarea id="note-content" name="content" required><?php echo $editNote ? htmlspecialchars($editNote['content']) : ''; ?></textarea>
+                            <label for="entry-username">Username/Email:</label>
+                            <input type="text" id="entry-username" name="entry_username" value="<?php echo $editPasswordEntry ? htmlspecialchars($editPasswordEntry['username']) : ''; ?>" required autocomplete="username" aria-required="true" placeholder="e.g., your_email@example.com">
+                            <span class="validation-message" aria-live="polite">Username/Email is required.</span>
                         </div>
                         <div class="form-group">
-                            <label for="note-tags">Tags (comma-separated):</label>
-                            <input type="text" id="note-tags" name="tags" value="<?php echo $editNote ? htmlspecialchars($editNote['tags']) : ''; ?>" placeholder="e.g., work, personal, important">
+                            <label for="entry-password">Password:</label>
+                            <div class="password-input-group">
+                                <input type="password" id="entry-password" name="entry_password" value="<?php echo $editPasswordEntry ? htmlspecialchars($editPasswordEntry['password']) : ''; ?>" required autocomplete="new-password" aria-required="true" placeholder="Enter or generate a strong password">
+                                <button type="button" class="btn btn-secondary" onclick="togglePasswordVisibility('entry-password', this)" aria-label="Toggle password visibility"><i class="fas fa-eye"></i> Show</button>
+                                <button type="button" class="btn btn-secondary" onclick="generatePassword()" aria-label="Generate strong password"><i class="fas fa-cogs"></i> Generate</button>
+                            </div>
+                            <span class="validation-message" aria-live="polite">Password is required.</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="url">URL:</label>
+                            <input type="url" id="url" name="url" value="<?php echo $editPasswordEntry ? htmlspecialchars($editPasswordEntry['url']) : ''; ?>" placeholder="https://example.com" autocomplete="url">
+                            <span class="validation-message" aria-live="polite">Please enter a valid URL.</span>
+                        </div>
+                        <div class="form-group">
+                            <label for="notes">Notes:</label>
+                            <textarea id="notes" name="notes" placeholder="Any additional details or security questions..." rows="4"><?php echo $editPasswordEntry ? htmlspecialchars($editPasswordEntry['notes']) : ''; ?></textarea>
+                            <span class="validation-message" aria-live="polite"></span>
+                        </div>
+                        <div class="form-group">
+                            <label for="category">Category:</label>
+                            <select id="category" name="category" aria-label="Select password category">
+                                <?php
+                                $categories = ['General', 'Social Media', 'Email', 'Banking', 'Shopping', 'Work', 'Entertainment', 'Gaming', 'Other'];
+                                $currentCategory = $editPasswordEntry ? htmlspecialchars($editPasswordEntry['category']) : 'General';
+                                foreach ($categories as $cat) {
+                                    echo '<option value="' . $cat . '"' . ($cat == $currentCategory ? ' selected' : '') . '>' . $cat . '</option>';
+                                }
+                                ?>
+                            </select>
+                            <span class="validation-message" aria-live="polite"></span>
                         </div>
                         <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                            <button type="submit" class="btn btn-inline-flex">
-                                <i class="fas <?php echo $editNote ? 'fa-save' : 'fa-plus-circle'; ?>"></i>
-                                <?php echo $editNote ? 'Update Note' : 'Create Note'; ?>
+                            <button type="submit" class="btn" aria-label="<?php echo $editPasswordEntry ? 'Update Entry' : 'Add New Entry'; ?>">
+                                <i class="fas <?php echo $editPasswordEntry ? 'fa-save' : 'fa-plus-circle'; ?>"></i>
+                                <?php echo $editPasswordEntry ? 'Update Entry' : 'Add Entry'; ?>
                             </button>
-                            <?php if ($editNote): ?>
-                                <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex">
+                            <?php if ($editPasswordEntry): ?>
+                                <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary" role="button" aria-label="Cancel editing entry">
                                     <i class="fas fa-times-circle"></i> Cancel
                                 </a>
                             <?php endif; ?>
                         </div>
                     </form>
-                </div>
+                </section>
 
-                <!-- Notes List -->
-                <div class="notes-list">
-                    <h2>Your Notes</h2>
-                    <form method="POST" class="search-bar">
-                        <input type="hidden" name="action" value="search_notes">
-                        <input type="text" name="search_term" placeholder="Search notes by title, content, or tags..." value="<?php echo isset($_POST['search_term']) ? htmlspecialchars($_POST['search_term']) : ''; ?>">
+                <!-- Password List -->
+                <section class="password-list" aria-labelledby="password-list-heading">
+                    <h2 id="password-list-heading">Your Saved Passwords</h2>
+                    <form method="POST" class="search-bar" aria-label="Search passwords form">
+                        <input type="hidden" name="action" value="search_passwords">
+                        <input type="text" name="search_term" placeholder="Search by site, username, notes, or category..." value="<?php echo isset($_POST['search_term']) ? htmlspecialchars($_POST['search_term']) : ''; ?>" aria-label="Search term input">
                         <button type="submit" class="btn btn-inline-flex"><i class="fas fa-search"></i> Search</button>
-                        <?php if (isset($_POST['action']) && $_POST['action'] === 'search_notes'): ?>
-                            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex"><i class="fas fa-redo"></i> Reset</a>
+                        <?php if (isset($_POST['action']) && $_POST['action'] === 'search_passwords'): ?>
+                            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex"><i class="fas fa-redo"></i> Reset Search</a>
                         <?php endif; ?>
                     </form>
 
-                    <?php if (empty($userNotes)): ?>
-                        <p>No notes found. Create your first note!</p>
+                    <?php if (empty($userPasswords)): ?>
+                        <p role="status">No password entries found. Add your first secure password!</p>
                     <?php else: ?>
-                        <?php foreach ($userNotes as $note): ?>
-                            <div class="note-card">
-                                <div class="note-title"><?php echo htmlspecialchars($note['title']); ?></div>
-                                <div class="note-content"><?php echo nl2br(htmlspecialchars(substr($note['content'], 0, 300))); ?><?php echo strlen($note['content']) > 300 ? '...' : ''; ?></div>
-                                <?php if (!empty($note['tags'])): ?>
-                                    <div class="note-tags">
-                                        <?php 
-                                            $tagsArray = array_map('trim', explode(',', $note['tags']));
-                                            foreach($tagsArray as $tag) {
-                                                if (!empty($tag)) {
-                                                    echo '<span class="note-tag">' . htmlspecialchars($tag) . '</span>';
-                                                }
-                                            }
-                                        ?>
+                        <?php foreach ($userPasswords as $entry): ?>
+                            <article class="password-entry-card" aria-label="Password entry for <?php echo htmlspecialchars($entry['website']); ?>">
+                                <div class="entry-title">
+                                    <span id="website-name-<?php echo htmlspecialchars($entry['id']); ?>"><?php echo htmlspecialchars($entry['website']); ?></span>
+                                    <span class="category-tag" aria-label="Category: <?php echo htmlspecialchars($entry['category']); ?>"><?php echo htmlspecialchars($entry['category']); ?></span>
+                                </div>
+                                <div class="entry-detail-row">
+                                    <i class="fas fa-user" aria-hidden="true"></i> <strong>Username:</strong> <span id="username-display-<?php echo htmlspecialchars($entry['id']); ?>"><?php echo htmlspecialchars($entry['username']); ?></span>
+                                    <button type="button" class="copy-btn" onclick="copyToClipboard('<?php echo htmlspecialchars(addslashes($entry['username'])); ?>', this)" aria-label="Copy username to clipboard"><i class="fas fa-copy"></i></button>
+                                </div>
+                                <div class="entry-detail-row">
+                                    <i class="fas fa-lock" aria-hidden="true"></i> <strong>Password:</strong>
+                                    <span id="password-display-<?php echo htmlspecialchars($entry['id']); ?>" class="entry-password-display entry-password-hidden">
+                                        <?php echo htmlspecialchars($entry['password']); ?>
+                                    </span>
+                                    <button type="button" class="copy-btn" onclick="copyToClipboard('<?php echo htmlspecialchars(addslashes($entry['password'])); ?>', this)" aria-label="Copy password to clipboard"><i class="fas fa-copy"></i></button>
+                                    <button type="button" class="copy-btn" onclick="togglePasswordVisibility('password-display-<?php echo htmlspecialchars($entry['id']); ?>', this)" aria-label="Toggle password visibility">
+                                        <i class="fas fa-eye"></i> Show
+                                    </button>
+                                </div>
+                                <?php if (!empty($entry['url'])): ?>
+                                    <div class="entry-detail-row">
+                                        <i class="fas fa-link" aria-hidden="true"></i> <strong>URL:</strong>
+                                        <a href="<?php echo htmlspecialchars($entry['url']); ?>" target="_blank" rel="noopener noreferrer" style="color: var(--primary-color); text-decoration: none;" aria-label="Go to <?php echo htmlspecialchars($entry['url']); ?>">
+                                            <?php echo htmlspecialchars($entry['url']); ?>
+                                        </a>
+                                        <button type="button" class="copy-btn" onclick="copyToClipboard('<?php echo htmlspecialchars(addslashes($entry['url'])); ?>', this)" aria-label="Copy URL to clipboard"><i class="fas fa-copy"></i></button>
                                     </div>
                                 <?php endif; ?>
-                                <div class="note-meta">
-                                    Created: <?php echo date('M j, Y g:i A', strtotime($note['created_at'])); ?>
-                                    <?php if ($note['updated_at'] != $note['created_at']): ?>
-                                        | Updated: <?php echo date('M j, Y g:i A', strtotime($note['updated_at'])); ?>
+                                <?php if (!empty($entry['notes'])): ?>
+                                    <div class="entry-notes">
+                                        <i class="fas fa-info-circle" aria-hidden="true"></i> <strong>Notes:</strong><br>
+                                        <?php echo nl2br(htmlspecialchars($entry['notes'])); ?>
+                                    </div>
+                                <?php endif; ?>
+                                <div class="entry-meta" aria-label="Entry metadata">
+                                    Created: <?php echo date('M j, Y g:i A', strtotime($entry['created_at'])); ?>
+                                    <?php if ($entry['updated_at'] != $entry['created_at']): ?>
+                                        | Updated: <?php echo date('M j, Y g:i A', strtotime($entry['updated_at'])); ?>
                                     <?php endif; ?>
                                 </div>
-                                <div class="note-actions">
-                                    <a href="?edit=<?php echo htmlspecialchars($note['id']); ?>" class="btn btn-secondary btn-inline-flex">
+                                <div class="entry-actions" role="group" aria-label="Actions for password entry">
+                                    <a href="?edit=<?php echo htmlspecialchars($entry['id']); ?>" class="btn btn-secondary" role="button" aria-label="Edit password entry">
                                         <i class="fas fa-edit"></i> Edit
                                     </a>
-                                    <button type="button" class="btn btn-danger btn-inline-flex" 
-                                            onclick="showConfirmModal(<?php echo htmlspecialchars($note['id']); ?>, 'delete_note')">
+                                    <button type="button" class="btn btn-danger"
+                                            onclick="showConfirmModal(<?php echo htmlspecialchars($entry['id']); ?>, 'delete_password')"
+                                            aria-label="Delete password entry">
                                         <i class="fas fa-trash-alt"></i> Delete
                                     </button>
                                 </div>
-                            </div>
+                            </article>
                         <?php endforeach; ?>
                     <?php endif; ?>
-                </div>
-            </div>
+                </section>
+            </main>
         <?php endif; ?>
     </div>
 
     <!-- Custom Confirmation Modal -->
-    <div id="confirmModal" class="modal">
+    <div id="confirmModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="confirmModalHeading" aria-describedby="modalMessage">
         <div class="modal-content">
-            <h3>Confirm Action</h3>
+            <h3 id="confirmModalHeading">Confirm Action</h3>
             <p id="modalMessage">Are you sure you want to proceed?</p>
             <div class="modal-buttons">
-                <button type="button" class="btn btn-danger" id="confirmYes">Yes</button>
-                <button type="button" class="btn btn-secondary" id="confirmNo">No</button>
+                <button type="button" class="btn btn-danger" id="confirmYes" aria-label="Confirm Yes">Yes</button>
+                <button type="button" class="btn btn-secondary" id="confirmNo" aria-label="Confirm No">No</button>
             </div>
         </div>
     </div>
 
+    <!-- Change Master Password Modal -->
+    <div id="changeMasterPasswordModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="changeMasterPasswordHeading">
+        <div class="modal-content">
+            <h3 id="changeMasterPasswordHeading">Change Your Master Password</h3>
+            <form method="POST">
+                <input type="hidden" name="action" value="change_master_password">
+                <div class="form-group">
+                    <label for="current-master-password">Current Master Password:</label>
+                    <input type="password" id="current-master-password" name="current_master_password" required autocomplete="current-password" aria-required="true" placeholder="Enter your current master password">
+                    <span class="validation-message" aria-live="polite">Current master password is required.</span>
+                </div>
+                <div class="form-group">
+                    <label for="new-master-password">New Master Password:</label>
+                    <input type="password" id="new-master-password" name="new_master_password" required autocomplete="new-password" aria-required="true" placeholder="Enter new master password">
+                    <span class="validation-message" aria-live="polite">New master password is required and must be at least 8 characters.</span>
+                </div>
+                <div class="form-group">
+                    <label for="confirm-new-master-password">Confirm New Master Password:</label>
+                    <input type="password" id="confirm-new-master-password" name="confirm_new_master_password" required autocomplete="new-password" aria-required="true" placeholder="Confirm new master password">
+                    <span class="validation-message" aria-live="polite">Passwords do not match.</span>
+                </div>
+                <div class="modal-buttons">
+                    <button type="submit" class="btn btn-success" aria-label="Change master password"><i class="fas fa-key"></i> Change Password</button>
+                    <button type="button" class="btn btn-secondary" onclick="closeModal('changeMasterPasswordModal')" aria-label="Cancel changing master password">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <script>
-        // Function to toggle between login, register, and forgot password forms
+        /**
+         * Toggles the display of authentication forms (Login, Register, Forgot Password).
+         * @param {string} formToShow - The ID of the form to display ('login', 'register', 'forgot_password').
+         */
         function toggleForm(formToShow) {
             const loginForm = document.getElementById('login-form');
             const registerForm = document.getElementById('register-form');
             const forgotPasswordForm = document.getElementById('forgot-password-form');
-            
+
             // Hide all forms first
             loginForm.style.display = 'none';
             registerForm.style.display = 'none';
@@ -1148,38 +1881,50 @@ if (isset($_GET['message'])) {
             // Show the requested form
             if (formToShow === 'login') {
                 loginForm.style.display = 'block';
+                document.getElementById('login-username').focus(); // Accessibility: Focus on first input
             } else if (formToShow === 'register') {
                 registerForm.style.display = 'block';
+                document.getElementById('reg-username').focus(); // Accessibility: Focus on first input
             } else if (formToShow === 'forgot_password') {
                 forgotPasswordForm.style.display = 'block';
+                document.getElementById('forgot-identifier').focus(); // Accessibility: Focus on first input
             }
         }
 
-        // Custom Confirmation Modal Logic
+        // --- Custom Confirmation Modal Logic ---
         const confirmModal = document.getElementById('confirmModal');
         const modalMessage = document.getElementById('modalMessage');
         const confirmYesBtn = document.getElementById('confirmYes');
         const confirmNoBtn = document.getElementById('confirmNo');
         let currentActionCallback = null; // Stores the function to call on confirmation
 
-        function showConfirmModal(noteId, actionType) {
+        /**
+         * Displays a confirmation modal with a specific message and action.
+         * @param {number} id - The ID of the item related to the action (e.g., password_id).
+         * @param {string} actionType - The type of action to confirm (e.g., 'delete_password').
+         */
+        function showConfirmModal(id, actionType) {
             let message = '';
             let formAction = '';
+            let idInputName = '';
 
-            if (actionType === 'delete_note') {
-                message = 'Are you sure you want to delete this note? This action cannot be undone.';
-                formAction = 'delete_note';
+            if (actionType === 'delete_password') {
+                message = 'Are you sure you want to delete this password entry? This action cannot be undone.';
+                formAction = 'delete_password';
+                idInputName = 'password_id';
             }
-            // Add other action types here if needed (e.g., 'archive_note')
+            // Add other action types here if needed
 
             modalMessage.textContent = message;
-            confirmModal.style.display = 'flex'; // Show modal
+            confirmModal.classList.add('is-visible'); // Show modal with transition
+            confirmModal.setAttribute('aria-hidden', 'false'); // Accessibility
+            confirmYesBtn.focus(); // Accessibility: Focus on the primary action button
 
             // Set the callback for when 'Yes' is clicked
             currentActionCallback = () => {
                 const form = document.createElement('form');
                 form.method = 'POST';
-                form.style.display = 'none';
+                form.style.display = 'none'; // Keep hidden
 
                 const actionInput = document.createElement('input');
                 actionInput.type = 'hidden';
@@ -1187,11 +1932,11 @@ if (isset($_GET['message'])) {
                 actionInput.value = formAction;
                 form.appendChild(actionInput);
 
-                const noteIdInput = document.createElement('input');
-                noteIdInput.type = 'hidden';
-                noteIdInput.name = 'note_id';
-                noteIdInput.value = noteId;
-                form.appendChild(noteIdInput);
+                const idInput = document.createElement('input');
+                idInput.type = 'hidden';
+                idInput.name = idInputName;
+                idInput.value = id;
+                form.appendChild(idInput);
 
                 document.body.appendChild(form);
                 form.submit(); // Submit the form
@@ -1200,30 +1945,345 @@ if (isset($_GET['message'])) {
 
         // Event listeners for modal buttons
         confirmYesBtn.onclick = function() {
-            confirmModal.style.display = 'none';
+            closeModal('confirmModal');
             if (currentActionCallback) {
                 currentActionCallback(); // Execute the stored callback
             }
         };
 
         confirmNoBtn.onclick = function() {
-            confirmModal.style.display = 'none';
+            closeModal('confirmModal');
             currentActionCallback = null; // Clear the callback
         };
+
+        // --- Change Master Password Modal Logic ---
+        const changeMasterPasswordModal = document.getElementById('changeMasterPasswordModal');
+
+        /**
+         * Displays the change master password modal.
+         */
+        function showChangeMasterPasswordModal() {
+            changeMasterPasswordModal.classList.add('is-visible'); // Show modal with transition
+            changeMasterPasswordModal.setAttribute('aria-hidden', 'false'); // Accessibility
+            document.getElementById('current-master-password').focus(); // Accessibility: Focus on first input
+        }
+
+        /**
+         * Closes a specified modal.
+         * @param {string} modalId - The ID of the modal element to close.
+         */
+        function closeModal(modalId) {
+            const modal = document.getElementById(modalId);
+            modal.classList.remove('is-visible'); // Hide modal with transition
+            modal.setAttribute('aria-hidden', 'true'); // Accessibility
+            // Optionally return focus to the element that opened the modal if known
+        }
 
         // Close modal if user clicks outside of it
         window.onclick = function(event) {
             if (event.target == confirmModal) {
-                confirmModal.style.display = "none";
+                closeModal('confirmModal');
                 currentActionCallback = null;
+            }
+            if (event.target == changeMasterPasswordModal) {
+                closeModal('changeMasterPasswordModal');
             }
         }
 
-        // Automatically hide messages after a few seconds
+        // --- Password Generator Logic ---
+        /**
+         * Generates a strong, random password and inserts it into the 'entry-password' field.
+         */
+        function generatePassword() {
+            const length = 16; // Default password length
+            // Character set includes uppercase, lowercase, numbers, and special characters
+            const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[{]}\\|;:'\",<.>/?`~";
+            let password = "";
+            for (let i = 0, n = charset.length; i < length; ++i) {
+                // Use Crypto API for better randomness if available
+                if (window.crypto && window.crypto.getRandomValues) {
+                    const randomBytes = new Uint32Array(1);
+                    window.crypto.getRandomValues(randomBytes);
+                    password += charset.charAt(randomBytes[0] % charset.length);
+                } else {
+                    password += charset.charAt(Math.floor(Math.random() * n));
+                }
+            }
+            document.getElementById('entry-password').value = password;
+            // Ensure password visibility toggle is set to 'show' if generated
+            const passwordInput = document.getElementById('entry-password');
+            const toggleButton = passwordInput.nextElementSibling; // The button after the input
+            if (passwordInput.type === 'password') { // If it's currently hidden
+                passwordInput.type = 'text'; // Show it
+                toggleButton.innerHTML = '<i class="fas fa-eye-slash"></i> Hide';
+                toggleButton.setAttribute('aria-label', 'Hide password'); // Update ARIA label
+            }
+            passwordInput.focus(); // Focus the input after generation
+        }
+
+        // --- Toggle Password Visibility Logic ---
+        /**
+         * Toggles the visibility of a password input or displayed password span.
+         * @param {string} elementId - The ID of the input or span element.
+         * @param {HTMLElement} button - The button element that triggered the toggle.
+         */
+        function togglePasswordVisibility(elementId, button) {
+            const element = document.getElementById(elementId);
+            if (!element) return; // Exit if element not found
+
+            if (element.tagName === 'INPUT') {
+                if (element.type === 'password') {
+                    element.type = 'text';
+                    button.innerHTML = '<i class="fas fa-eye-slash"></i> Hide';
+                    button.setAttribute('aria-label', 'Hide password'); // Update ARIA label
+                } else {
+                    element.type = 'password';
+                    button.innerHTML = '<i class="fas fa-eye"></i> Show';
+                    button.setAttribute('aria-label', 'Show password'); // Update ARIA label
+                }
+            } else if (element.tagName === 'SPAN') { // For displayed passwords in the list
+                if (element.classList.contains('entry-password-hidden')) {
+                    element.classList.remove('entry-password-hidden');
+                    button.innerHTML = '<i class="fas fa-eye-slash"></i> Hide';
+                    button.setAttribute('aria-label', 'Hide password'); // Update ARIA label
+                } else {
+                    element.classList.add('entry-password-hidden');
+                    button.innerHTML = '<i class="fas fa-eye"></i> Show';
+                    button.setAttribute('aria-label', 'Show password'); // Update ARIA label
+                }
+            }
+        }
+
+
+        // --- Copy to Clipboard Logic ---
+        /**
+         * Copies provided text to the clipboard and provides visual feedback.
+         * @param {string} text - The text to copy.
+         * @param {HTMLElement} button - The button element that triggered the copy.
+         */
+        function copyToClipboard(text, button) {
+            // Create a temporary input element
+            const tempInput = document.createElement('textarea');
+            tempInput.value = text;
+            document.body.appendChild(tempInput);
+            tempInput.select();
+            document.execCommand('copy'); // Use execCommand for broader compatibility in iframes
+            document.body.removeChild(tempInput);
+
+            // Provide visual feedback
+            const originalButtonContent = button.innerHTML;
+            const originalBackgroundColor = button.style.backgroundColor;
+            const originalColor = button.style.color;
+
+            button.innerHTML = '<i class="fas fa-check"></i> Copied!';
+            button.style.backgroundColor = 'var(--success-color)';
+            button.style.color = 'white';
+            button.setAttribute('aria-live', 'assertive'); // Announce to screen readers
+
+            setTimeout(() => {
+                button.innerHTML = originalButtonContent;
+                button.style.backgroundColor = originalBackgroundColor; // Reset to default
+                button.style.color = originalColor; // Reset to default
+                button.removeAttribute('aria-live'); // Remove assertive role
+            }, 1500); // Reset after 1.5 seconds
+        }
+
+        // --- Client-Side Form Validation Logic ---
+        /**
+         * Attaches real-time validation listeners to form inputs.
+         * @param {HTMLFormElement} form - The form element to validate.
+         */
+        function setupFormValidation(form) {
+            const inputs = form.querySelectorAll('input[required], textarea[required], select[required], input[type="email"], input[type="url"]');
+            
+            inputs.forEach(input => {
+                // Find the validation message span, assuming it's the next sibling
+                const validationMessageSpan = input.nextElementSibling && input.nextElementSibling.classList.contains('validation-message')
+                                            ? input.nextElementSibling
+                                            : null;
+
+                // Initial validation on load for pre-filled fields (if any)
+                validateInput(input, validationMessageSpan);
+
+                input.addEventListener('input', () => {
+                    validateInput(input, validationMessageSpan);
+                });
+                input.addEventListener('blur', () => { // Validate on blur
+                    validateInput(input, validationMessageSpan);
+                });
+            });
+
+            // Specific validation for password fields (min length, match)
+            // Note: Changed IDs for consistency and clarity
+            const passwordField = form.querySelector('#reg-password, #forgot-new-password, #new-master-password, #entry-password');
+            const confirmPasswordField = form.querySelector('#forgot-confirm-new-password, #confirm-new-master-password');
+
+            if (passwordField && passwordField.id === 'entry-password') {
+                // For the 'Add/Edit Password' form, just validate the single password input
+                const validationMessageSpan = passwordField.nextElementSibling && passwordField.nextElementSibling.classList.contains('validation-message')
+                                            ? passwordField.nextElementSibling
+                                            : (passwordField.closest('.form-group') ? passwordField.closest('.form-group').querySelector('.validation-message') : null);
+                
+                passwordField.addEventListener('input', () => {
+                    // Check if the input is empty or too short
+                    if (passwordField.value.length === 0) {
+                        validationMessageSpan.textContent = 'Password is required.';
+                        validationMessageSpan.style.display = 'block';
+                        passwordField.setAttribute('aria-invalid', 'true');
+                    } else if (passwordField.value.length < 8) {
+                        validationMessageSpan.textContent = 'Password must be at least 8 characters long.';
+                        validationMessageSpan.style.display = 'block';
+                        passwordField.setAttribute('aria-invalid', 'true');
+                    } else {
+                        validationMessageSpan.textContent = '';
+                        validationMessageSpan.style.display = 'none';
+                        passwordField.setAttribute('aria-invalid', 'false');
+                    }
+                });
+                 passwordField.addEventListener('blur', () => { // Validate on blur
+                    // Check if the input is empty or too short
+                    if (passwordField.value.length === 0) {
+                        validationMessageSpan.textContent = 'Password is required.';
+                        validationMessageSpan.style.display = 'block';
+                        passwordField.setAttribute('aria-invalid', 'true');
+                    } else if (passwordField.value.length < 8) {
+                        validationMessageSpan.textContent = 'Password must be at least 8 characters long.';
+                        validationMessageSpan.style.display = 'block';
+                        passwordField.setAttribute('aria-invalid', 'true');
+                    } else {
+                        validationMessageSpan.textContent = '';
+                        validationMessageSpan.style.display = 'none';
+                        passwordField.setAttribute('aria-invalid', 'false');
+                    }
+                });
+            }
+
+
+            if (passwordField && confirmPasswordField) { // Applicable to register, forgot password, change master password forms
+                passwordField.addEventListener('input', () => validatePasswordMatch(passwordField, confirmPasswordField));
+                passwordField.addEventListener('blur', () => validatePasswordMatch(passwordField, confirmPasswordField));
+                confirmPasswordField.addEventListener('input', () => validatePasswordMatch(passwordField, confirmPasswordField));
+                confirmPasswordField.addEventListener('blur', () => validatePasswordMatch(passwordField, confirmPasswordField));
+            }
+
+
+            form.addEventListener('submit', (event) => {
+                let formIsValid = true;
+                inputs.forEach(input => {
+                    // Pass the correct validation message span
+                    const validationMessageSpan = input.nextElementSibling && input.nextElementSibling.classList.contains('validation-message')
+                                                    ? input.nextElementSibling
+                                                    : (input.closest('.form-group') ? input.closest('.form-group').querySelector('.validation-message') : null);
+                    if (!validateInput(input, validationMessageSpan)) { // Re-validate all on submit
+                        formIsValid = false;
+                    }
+                });
+
+                // Re-check password match on submit if applicable
+                if (passwordField && confirmPasswordField && !validatePasswordMatch(passwordField, confirmPasswordField)) {
+                    formIsValid = false;
+                }
+
+                 // Special validation for 'entry-password' in add/edit form
+                if (passwordField && passwordField.id === 'entry-password') {
+                    const validationMessageSpan = passwordField.nextElementSibling && passwordField.nextElementSibling.classList.contains('validation-message')
+                                            ? passwordField.nextElementSibling
+                                            : (passwordField.closest('.form-group') ? passwordField.closest('.form-group').querySelector('.validation-message') : null);
+                    if (passwordField.value.length === 0 || passwordField.value.length < 8) {
+                        formIsValid = false;
+                        validateInput(passwordField, validationMessageSpan); // Show message on submit
+                    }
+                }
+
+
+                if (!formIsValid) {
+                    event.preventDefault(); // Stop form submission if invalid
+                    // Find first invalid input and focus it for accessibility
+                    const firstInvalid = form.querySelector('input:invalid, textarea:invalid, select:invalid');
+                    if (firstInvalid) {
+                        firstInvalid.focus();
+                        // Scroll to the first invalid element if it's not in view
+                        firstInvalid.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
+            });
+        }
+
+        /**
+         * Validates a single input element and displays an appropriate message.
+         * @param {HTMLInputElement|HTMLTextAreaElement|HTMLSelectElement} input - The input element to validate.
+         * @param {HTMLElement} messageSpan - The span element to display validation messages.
+         * @returns {boolean} True if the input is valid, false otherwise.
+         */
+        function validateInput(input, messageSpan) {
+            if (!messageSpan) return true; // No message span to display feedback
+
+            let isValid = input.checkValidity();
+            let customMessage = '';
+
+            if (input.validity.valueMissing) {
+                customMessage = `${input.previousElementSibling ? input.previousElementSibling.textContent.replace(':', '') : 'This field'} is required.`;
+                isValid = false;
+            } else if (input.type === 'email' && input.validity.typeMismatch) {
+                customMessage = 'Please enter a valid email address.';
+                isValid = false;
+            } else if (input.type === 'url' && input.validity.typeMismatch) {
+                customMessage = 'Please enter a valid URL (e.g., https://example.com).';
+                isValid = false;
+            } else if ((input.id === 'login-password' || input.id === 'reg-password' || input.id === 'forgot-old-password' || input.id === 'forgot-new-password' || input.id === 'current-master-password' || input.id === 'new-master-password') && input.value.length > 0 && input.value.length < 8) {
+                 customMessage = 'Password must be at least 8 characters long.';
+                 isValid = false;
+            }
+
+
+            messageSpan.textContent = customMessage;
+            messageSpan.style.display = isValid ? 'none' : 'block';
+            input.setAttribute('aria-invalid', !isValid);
+
+            return isValid;
+        }
+
+        /**
+         * Validates if two password fields match.
+         * @param {HTMLInputElement} passwordField - The main password input.
+         * @param {HTMLInputElement} confirmPasswordField - The confirmation password input.
+         * @returns {boolean} True if passwords match and are valid, false otherwise.
+         */
+        function validatePasswordMatch(passwordField, confirmPasswordField) {
+            if (!passwordField || !confirmPasswordField) return true; // Not applicable or elements not found
+
+            const passwordMessageSpan = passwordField.nextElementSibling && passwordField.nextElementSibling.classList.contains('validation-message')
+                                        ? passwordField.nextElementSibling
+                                        : (passwordField.closest('.form-group') ? passwordField.closest('.form-group').querySelector('.validation-message') : null);
+            const confirmPasswordMessageSpan = confirmPasswordField.nextElementSibling && confirmPasswordField.nextElementSibling.classList.contains('validation-message')
+                                            ? confirmPasswordField.nextElementSibling
+                                            : (confirmPasswordField.closest('.form-group') ? confirmPasswordField.closest('.form-group').querySelector('.validation-message') : null);
+
+            let passwordValid = validateInput(passwordField, passwordMessageSpan);
+            let confirmPasswordValid = validateInput(confirmPasswordField, confirmPasswordMessageSpan);
+
+            let passwordsMatch = (passwordField.value === confirmPasswordField.value);
+
+            if (passwordValid && confirmPasswordValid && !passwordsMatch) {
+                confirmPasswordMessageSpan.textContent = 'Passwords do not match.';
+                confirmPasswordMessageSpan.style.display = 'block';
+                confirmPasswordField.setAttribute('aria-invalid', 'true');
+                return false;
+            } else if (passwordValid && confirmPasswordValid && passwordsMatch) {
+                confirmPasswordMessageSpan.textContent = '';
+                confirmPasswordMessageSpan.style.display = 'none';
+                confirmPasswordField.setAttribute('aria-invalid', 'false');
+                return true;
+            } else {
+                return passwordValid && confirmPasswordValid;
+            }
+        }
+
+        // --- General DOM Content Loaded Logic ---
         document.addEventListener('DOMContentLoaded', (event) => {
             const successMessage = document.querySelector('.message.success');
             const errorMessage = document.querySelector('.message.error');
-            
+
             // Function to animate message hiding
             const hideMessage = (element) => {
                 element.style.transition = 'opacity 1s ease-out, height 1s ease-out, padding 1s ease-out, margin-bottom 1s ease-out';
@@ -1235,19 +2295,68 @@ if (isset($_GET['message'])) {
             };
 
             if (successMessage) {
-                setTimeout(() => hideMessage(successMessage), 5000); 
+                setTimeout(() => hideMessage(successMessage), 5000); // Hide after 5 seconds
             }
             if (errorMessage) {
-                setTimeout(() => hideMessage(errorMessage), 5000); 
+                setTimeout(() => hideMessage(errorMessage), 5000); // Hide after 5 seconds
             }
-            
-            // Initial toggle based on query parameters or default to login
-            const urlParams = new URLSearchParams(window.location.search);
-            // If there's a message from a redirect, it means an action happened.
-            // We want to default to the login form for unauthenticated users.
+
+            // Initial form toggle based on session status
+            // This ensures the correct form is shown on page load if not logged in
             if (!<?php echo isset($_SESSION['user_id']) ? 'true' : 'false'; ?>) {
-                toggleForm('login'); 
+                // Determine which form to show based on GET parameters for messages/errors
+                const urlParams = new URLSearchParams(window.location.search);
+                if (urlParams.has('message') || urlParams.has('error')) {
+                    // Try to guess which form triggered the message/error for better UX
+                    const errorMessageContent = urlParams.get('error') || '';
+                    const messageContent = urlParams.get('message') || '';
+
+                    if (errorMessageContent.includes('Registration failed') || messageContent.includes('Registration successful')) {
+                         toggleForm('register');
+                    } else if (errorMessageContent.includes('Failed to update password') || messageContent.includes('Password updated successfully')) {
+                        toggleForm('forgot_password');
+                    } else {
+                        toggleForm('login'); // Default to login if no specific message
+                    }
+                } else {
+                    toggleForm('login');
+                }
             }
+
+            // Apply client-side validation to all relevant forms
+            const authForms = document.querySelectorAll('#login-form form, #register-form form, #forgot-password-form form');
+            authForms.forEach(form => setupFormValidation(form));
+
+            const passwordForm = document.querySelector('.password-form form');
+            if (passwordForm) {
+                setupFormValidation(passwordForm);
+            }
+
+            const changeMasterPasswordForm = document.querySelector('#changeMasterPasswordModal form');
+            if (changeMasterPasswordForm) {
+                // Assign a unique ID to the form for better targeting in validation
+                changeMasterPasswordForm.id = 'changeMasterPasswordModalForm';
+                setupFormValidation(changeMasterPasswordForm);
+            }
+
+            // Handle initial password visibility for displayed entries
+            document.querySelectorAll('.entry-password-display').forEach(span => {
+                span.classList.add('entry-password-hidden'); // Ensure they are hidden by default
+                // Find the corresponding button and update its text
+                const button = span.nextElementSibling && span.nextElementSibling.nextElementSibling; // Assuming copy button then toggle button
+                if (button && button.tagName === 'BUTTON' && button.onclick.toString().includes('togglePasswordVisibility')) {
+                    button.innerHTML = '<i class="fas fa-eye"></i> Show';
+                    button.setAttribute('aria-label', 'Show password');
+                }
+            });
+
+            // Check if the change master password modal should be visible on load due to an error
+            // This happens if there was an error in the PHP processing of the form in the modal
+            const urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.has('error') && urlParams.get('error').includes('Failed to change master password')) {
+                showChangeMasterPasswordModal();
+            }
+
         });
 
     </script>
