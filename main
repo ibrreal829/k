@@ -1,1 +1,597 @@
+<?php
+session_start();
 
+// Database setup
+class Database {
+    private $db;
+    
+    public function __construct() {
+        $this->db = new SQLite3('notes_app.db');
+        $this->createTables();
+    }
+    
+    private function createTables() {
+        // Users table
+        $this->db->exec('
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ');
+        
+        // Notes table
+        $this->db->exec('
+            CREATE TABLE IF NOT EXISTS notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id)
+            )
+        ');
+    }
+    
+    public function getConnection() {
+        return $this->db;
+    }
+}
+
+// User class
+class User {
+    private $db;
+    
+    public function __construct($database) {
+        $this->db = $database->getConnection();
+    }
+    
+    public function register($username, $email, $password) {
+        $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
+        $stmt = $this->db->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
+        $stmt->bindValue(1, $username, SQLITE3_TEXT);
+        $stmt->bindValue(2, $email, SQLITE3_TEXT);
+        $stmt->bindValue(3, $hashedPassword, SQLITE3_TEXT);
+        return $stmt->execute();
+    }
+    
+    public function login($username, $password) {
+        $stmt = $this->db->prepare('SELECT * FROM users WHERE username = ? OR email = ?');
+        $stmt->bindValue(1, $username, SQLITE3_TEXT);
+        $stmt->bindValue(2, $username, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+        
+        if ($user && password_verify($password, $user['password'])) {
+            return $user;
+        }
+        return false;
+    }
+}
+
+// Notes class
+class Notes {
+    private $db;
+    
+    public function __construct($database) {
+        $this->db = $database->getConnection();
+    }
+    
+    public function create($userId, $title, $content) {
+        $stmt = $this->db->prepare('INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)');
+        $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $title, SQLITE3_TEXT);
+        $stmt->bindValue(3, $content, SQLITE3_TEXT);
+        return $stmt->execute();
+    }
+    
+    public function getUserNotes($userId) {
+        $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC');
+        $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        
+        $notes = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $notes[] = $row;
+        }
+        return $notes;
+    }
+    
+    public function getNote($noteId, $userId) {
+        $stmt = $this->db->prepare('SELECT * FROM notes WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        return $result->fetchArray(SQLITE3_ASSOC);
+    }
+    
+    public function update($noteId, $userId, $title, $content) {
+        $stmt = $this->db->prepare('UPDATE notes SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $title, SQLITE3_TEXT);
+        $stmt->bindValue(2, $content, SQLITE3_TEXT);
+        $stmt->bindValue(3, $noteId, SQLITE3_INTEGER);
+        $stmt->bindValue(4, $userId, SQLITE3_INTEGER);
+        return $stmt->execute();
+    }
+    
+    public function delete($noteId, $userId) {
+        $stmt = $this->db->prepare('DELETE FROM notes WHERE id = ? AND user_id = ?');
+        $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
+        return $stmt->execute();
+    }
+}
+
+// Initialize classes
+$database = new Database();
+$user = new User($database);
+$notes = new Notes($database);
+
+// Handle form submissions
+$message = '';
+$error = '';
+
+if ($_POST) {
+    if (isset($_POST['action'])) {
+        switch ($_POST['action']) {
+            case 'register':
+                if ($user->register($_POST['username'], $_POST['email'], $_POST['password'])) {
+                    $message = 'Registration successful! Please login.';
+                } else {
+                    $error = 'Registration failed. Username or email might already exist.';
+                }
+                break;
+                
+            case 'login':
+                $userData = $user->login($_POST['username'], $_POST['password']);
+                if ($userData) {
+                    $_SESSION['user_id'] = $userData['id'];
+                    $_SESSION['username'] = $userData['username'];
+                    header('Location: ' . $_SERVER['PHP_SELF']);
+                    exit;
+                } else {
+                    $error = 'Invalid credentials.';
+                }
+                break;
+                
+            case 'logout':
+                session_destroy();
+                header('Location: ' . $_SERVER['PHP_SELF']);
+                exit;
+                break;
+                
+            case 'create_note':
+                if (isset($_SESSION['user_id'])) {
+                    if ($notes->create($_SESSION['user_id'], $_POST['title'], $_POST['content'])) {
+                        $message = 'Note created successfully!';
+                    } else {
+                        $error = 'Failed to create note.';
+                    }
+                }
+                break;
+                
+            case 'update_note':
+                if (isset($_SESSION['user_id'])) {
+                    if ($notes->update($_POST['note_id'], $_SESSION['user_id'], $_POST['title'], $_POST['content'])) {
+                        $message = 'Note updated successfully!';
+                    } else {
+                        $error = 'Failed to update note.';
+                    }
+                }
+                break;
+                
+            case 'delete_note':
+                if (isset($_SESSION['user_id'])) {
+                    if ($notes->delete($_POST['note_id'], $_SESSION['user_id'])) {
+                        $message = 'Note deleted successfully!';
+                    } else {
+                        $error = 'Failed to delete note.';
+                    }
+                }
+                break;
+        }
+    }
+}
+
+// Get current note for editing
+$editNote = null;
+if (isset($_GET['edit']) && isset($_SESSION['user_id'])) {
+    $editNote = $notes->getNote($_GET['edit'], $_SESSION['user_id']);
+}
+
+// Get user notes
+$userNotes = [];
+if (isset($_SESSION['user_id'])) {
+    $userNotes = $notes->getUserNotes($_SESSION['user_id']);
+}
+?>
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Notes App</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        .auth-container {
+            max-width: 400px;
+            margin: 100px auto;
+            background: white;
+            padding: 40px;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        }
+
+        .app-header {
+            background: white;
+            padding: 20px;
+            border-radius: 15px;
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .welcome {
+            color: #333;
+            font-size: 24px;
+            font-weight: 600;
+        }
+
+        .logout-btn {
+            background: #e74c3c;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 500;
+        }
+
+        .logout-btn:hover {
+            background: #c0392b;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 30px;
+        }
+
+        .note-form {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            height: fit-content;
+        }
+
+        .notes-list {
+            background: white;
+            padding: 30px;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            color: #333;
+            font-weight: 500;
+        }
+
+        .form-group input,
+        .form-group textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+
+        .form-group input:focus,
+        .form-group textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        .form-group textarea {
+            height: 150px;
+            resize: vertical;
+        }
+
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            transition: background 0.3s;
+        }
+
+        .btn:hover {
+            background: #5a67d8;
+        }
+
+        .btn-secondary {
+            background: #6c757d;
+        }
+
+        .btn-secondary:hover {
+            background: #5a6268;
+        }
+
+        .btn-danger {
+            background: #e74c3c;
+        }
+
+        .btn-danger:hover {
+            background: #c0392b;
+        }
+
+        .note-card {
+            background: #f8f9fa;
+            padding: 20px;
+            margin-bottom: 20px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .note-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 10px;
+        }
+
+        .note-content {
+            color: #666;
+            margin-bottom: 15px;
+            line-height: 1.6;
+        }
+
+        .note-meta {
+            font-size: 12px;
+            color: #999;
+            margin-bottom: 15px;
+        }
+
+        .note-actions {
+            display: flex;
+            gap: 10px;
+        }
+
+        .note-actions button {
+            padding: 6px 12px;
+            font-size: 14px;
+        }
+
+        .message {
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            font-weight: 500;
+        }
+
+        .message.success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+
+        .message.error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+
+        .auth-toggle {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        .auth-toggle a {
+            color: #667eea;
+            text-decoration: none;
+        }
+
+        .auth-toggle a:hover {
+            text-decoration: underline;
+        }
+
+        h1, h2 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .auth-container {
+                margin: 50px auto;
+                padding: 30px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <?php if (!isset($_SESSION['user_id'])): ?>
+            <!-- Authentication Forms -->
+            <div class="auth-container">
+                <?php if ($message): ?>
+                    <div class="message success"><?php echo htmlspecialchars($message); ?></div>
+                <?php endif; ?>
+                
+                <?php if ($error): ?>
+                    <div class="message error"><?php echo htmlspecialchars($error); ?></div>
+                <?php endif; ?>
+
+                <div id="login-form">
+                    <h2>Login</h2>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="login">
+                        <div class="form-group">
+                            <label>Username or Email:</label>
+                            <input type="text" name="username" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Password:</label>
+                            <input type="password" name="password" required>
+                        </div>
+                        <button type="submit" class="btn">Login</button>
+                    </form>
+                    <div class="auth-toggle">
+                        <a href="#" onclick="toggleForm()">Don't have an account? Sign up</a>
+                    </div>
+                </div>
+
+                <div id="register-form" style="display: none;">
+                    <h2>Sign Up</h2>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="register">
+                        <div class="form-group">
+                            <label>Username:</label>
+                            <input type="text" name="username" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Email:</label>
+                            <input type="email" name="email" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Password:</label>
+                            <input type="password" name="password" required>
+                        </div>
+                        <button type="submit" class="btn">Sign Up</button>
+                    </form>
+                    <div class="auth-toggle">
+                        <a href="#" onclick="toggleForm()">Already have an account? Login</a>
+                    </div>
+                </div>
+            </div>
+
+        <?php else: ?>
+            <!-- Main Application -->
+            <div class="app-header">
+                <div class="welcome">Welcome, <?php echo htmlspecialchars($_SESSION['username']); ?>!</div>
+                <form method="POST" style="display: inline;">
+                    <input type="hidden" name="action" value="logout">
+                    <button type="submit" class="logout-btn">Logout</button>
+                </form>
+            </div>
+
+            <?php if ($message): ?>
+                <div class="message success"><?php echo htmlspecialchars($message); ?></div>
+            <?php endif; ?>
+            
+            <?php if ($error): ?>
+                <div class="message error"><?php echo htmlspecialchars($error); ?></div>
+            <?php endif; ?>
+
+            <div class="main-content">
+                <!-- Note Form -->
+                <div class="note-form">
+                    <h2><?php echo $editNote ? 'Edit Note' : 'Create New Note'; ?></h2>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="<?php echo $editNote ? 'update_note' : 'create_note'; ?>">
+                        <?php if ($editNote): ?>
+                            <input type="hidden" name="note_id" value="<?php echo $editNote['id']; ?>">
+                        <?php endif; ?>
+                        
+                        <div class="form-group">
+                            <label>Title:</label>
+                            <input type="text" name="title" value="<?php echo $editNote ? htmlspecialchars($editNote['title']) : ''; ?>" required>
+                        </div>
+                        <div class="form-group">
+                            <label>Content:</label>
+                            <textarea name="content" required><?php echo $editNote ? htmlspecialchars($editNote['content']) : ''; ?></textarea>
+                        </div>
+                        <div style="display: flex; gap: 10px;">
+                            <button type="submit" class="btn"><?php echo $editNote ? 'Update Note' : 'Create Note'; ?></button>
+                            <?php if ($editNote): ?>
+                                <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary">Cancel</a>
+                            <?php endif; ?>
+                        </div>
+                    </form>
+                </div>
+
+                <!-- Notes List -->
+                <div class="notes-list">
+                    <h2>Your Notes</h2>
+                    <?php if (empty($userNotes)): ?>
+                        <p>No notes yet. Create your first note!</p>
+                    <?php else: ?>
+                        <?php foreach ($userNotes as $note): ?>
+                            <div class="note-card">
+                                <div class="note-title"><?php echo htmlspecialchars($note['title']); ?></div>
+                                <div class="note-content"><?php echo nl2br(htmlspecialchars(substr($note['content'], 0, 200))); ?><?php echo strlen($note['content']) > 200 ? '...' : ''; ?></div>
+                                <div class="note-meta">
+                                    Created: <?php echo date('M j, Y g:i A', strtotime($note['created_at'])); ?>
+                                    <?php if ($note['updated_at'] != $note['created_at']): ?>
+                                        | Updated: <?php echo date('M j, Y g:i A', strtotime($note['updated_at'])); ?>
+                                    <?php endif; ?>
+                                </div>
+                                <div class="note-actions">
+                                    <a href="?edit=<?php echo $note['id']; ?>" class="btn btn-secondary">Edit</a>
+                                    <form method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to delete this note?')">
+                                        <input type="hidden" name="action" value="delete_note">
+                                        <input type="hidden" name="note_id" value="<?php echo $note['id']; ?>">
+                                        <button type="submit" class="btn btn-danger">Delete</button>
+                                    </form>
+                                </div>
+                            </div>
+                        <?php endforeach; ?>
+                    <?php endif; ?>
+                </div>
+            </div>
+        <?php endif; ?>
+    </div>
+
+    <script>
+        function toggleForm() {
+            const loginForm = document.getElementById('login-form');
+            const registerForm = document.getElementById('register-form');
+            
+            if (loginForm.style.display === 'none') {
+                loginForm.style.display = 'block';
+                registerForm.style.display = 'none';
+            } else {
+                loginForm.style.display = 'none';
+                registerForm.style.display = 'block';
+            }
+        }
+    </script>
+</body>
+</html>
