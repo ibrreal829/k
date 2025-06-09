@@ -8,8 +8,8 @@ class Database {
     public function __construct() {
         // Create or open the SQLite database file
         $this->db = new SQLite3('notes_app.db');
-        // Ensure write access for the database file
-        $this->db->exec('PRAGMA journal_mode = WAL;'); // Enable Write-Ahead Logging for better concurrency
+        // Enable Write-Ahead Logging for better concurrency and performance
+        $this->db->exec('PRAGMA journal_mode = WAL;'); 
         $this->createTables();
     }
     
@@ -21,29 +21,50 @@ class Database {
                 username TEXT UNIQUE NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 password TEXT NOT NULL,
+                session_version INTEGER DEFAULT 0, -- Column for session invalidation
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         ');
         
-        // Notes table with new 'tags' column
-        // Added IF NOT EXISTS for columns to allow schema evolution without dropping table
+        // Add 'session_version' column if it doesn't exist (for existing databases)
+        $result = $this->db->query("PRAGMA table_info(users);");
+        $hasSessionVersionColumn = false;
+        while ($col = $result->fetchArray(SQLITE3_ASSOC)) {
+            if ($col['name'] == 'session_version') {
+                $hasSessionVersionColumn = true;
+                break;
+            }
+        }
+        if (!$hasSessionVersionColumn) {
+            $this->db->exec("ALTER TABLE users ADD COLUMN session_version INTEGER DEFAULT 0");
+        }
+
+        // Notes table with 'tags' column
         $this->db->exec('
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
-                tags TEXT DEFAULT "", -- New column for comma-separated tags
+                tags TEXT DEFAULT "", -- Column for comma-separated tags
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             )
         ');
 
-        // Add 'tags' column if it doesn't exist (for existing databases)
-        $this->db->exec("
-            ALTER TABLE notes ADD COLUMN tags TEXT DEFAULT ''
-        ");
+        // Add 'tags' column if it doesn't exist
+        $result = $this->db->query("PRAGMA table_info(notes);");
+        $hasTagsColumn = false;
+        while ($col = $result->fetchArray(SQLITE3_ASSOC)) {
+            if ($col['name'] == 'tags') {
+                $hasTagsColumn = true;
+                break;
+            }
+        }
+        if (!$hasTagsColumn) {
+            $this->db->exec("ALTER TABLE notes ADD COLUMN tags TEXT DEFAULT ''");
+        }
     }
     
     public function getConnection() {
@@ -61,7 +82,6 @@ class User {
     
     public function register($username, $email, $password) {
         $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
-        // Prepare statement to prevent SQL injection
         $stmt = $this->db->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
         $stmt->bindValue(1, $username, SQLITE3_TEXT);
         $stmt->bindValue(2, $email, SQLITE3_TEXT);
@@ -78,9 +98,79 @@ class User {
         $user = $result->fetchArray(SQLITE3_ASSOC);
         
         if ($user && password_verify($password, $user['password'])) {
+            // Store the current session version in $_SESSION
+            $_SESSION['session_version'] = $user['session_version'];
             return $user;
         }
         return false;
+    }
+
+    // Method to increment session version for a user, invalidating other sessions
+    public function incrementSessionVersion($userId) {
+        $stmt = $this->db->prepare('UPDATE users SET session_version = session_version + 1 WHERE id = ?');
+        $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
+        return $stmt->execute();
+    }
+
+    // Method to change password, requiring old password and incrementing session version
+    public function changePassword($userId, $oldPassword, $newPassword) {
+        // First, verify the old password
+        $stmt = $this->db->prepare('SELECT password FROM users WHERE id = ?');
+        $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$user || !password_verify($oldPassword, $user['password'])) {
+            return false; // Old password does not match or user not found
+        }
+
+        // If old password is correct, hash and update the new password
+        $hashedNewPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+        $stmt = $this->db->prepare('UPDATE users SET password = ? WHERE id = ?');
+        $stmt->bindValue(1, $hashedNewPassword, SQLITE3_TEXT);
+        $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
+        $success = $stmt->execute();
+
+        if ($success) {
+            // Increment session version to invalidate other sessions upon password change
+            $this->incrementSessionVersion($userId);
+            // Update the session's stored version as well
+            $_SESSION['session_version'] = $_SESSION['session_version'] + 1;
+        }
+        return $success;
+    }
+
+    // New method for password change from login page (Forgot Password), requiring old password
+    public function resetPasswordFromLogin($identifier, $oldPassword, $newPassword) {
+        // Find user by username or email
+        $stmt = $this->db->prepare('SELECT id, password FROM users WHERE username = ? OR email = ?');
+        $stmt->bindValue(1, $identifier, SQLITE3_TEXT);
+        $stmt->bindValue(2, $identifier, SQLITE3_TEXT);
+        $result = $stmt->execute();
+        $user = $result->fetchArray(SQLITE3_ASSOC);
+
+        if (!$user) {
+            return false; // User not found
+        }
+
+        // Verify the old password
+        if (!password_verify($oldPassword, $user['password'])) {
+            return false; // Old password does not match
+        }
+
+        // If old password is correct, hash and update the new password
+        $hashedNewPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+        $stmt = $this->db->prepare('UPDATE users SET password = ? WHERE id = ?');
+        $stmt->bindValue(1, $hashedNewPassword, SQLITE3_TEXT);
+        $stmt->bindValue(2, $user['id'], SQLITE3_INTEGER);
+        $success = $stmt->execute();
+
+        if ($success) {
+            // Increment session version to invalidate other sessions upon password change
+            $this->incrementSessionVersion($user['id']);
+            // Note: Current session is not logged out here. The centralized check will handle it on next page load.
+        }
+        return $success;
     }
 }
 
@@ -129,7 +219,7 @@ class Notes {
         $stmt = $this->db->prepare('UPDATE notes SET title = ?, content = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
         $stmt->bindValue(1, $title, SQLITE3_TEXT);
         $stmt->bindValue(2, $content, SQLITE3_TEXT);
-        $stmt->bindValue(3, $tags, SQLITE3_TEXT); // Update tags as well
+        $stmt->bindValue(3, $tags, SQLITE3_TEXT); 
         $stmt->bindValue(4, $noteId, SQLITE3_INTEGER);
         $stmt->bindValue(5, $userId, SQLITE3_INTEGER);
         return $stmt->execute();
@@ -145,7 +235,7 @@ class Notes {
 
     // Search notes by title, content, or tags for a given user
     public function searchNotes($userId, $searchTerm) {
-        $searchTerm = '%' . $searchTerm . '%'; // Wildcard for LIKE queries
+        $searchTerm = '%' . $searchTerm . '%'; 
         $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? AND (title LIKE ? OR content LIKE ? OR tags LIKE ?) ORDER BY updated_at DESC');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $searchTerm, SQLITE3_TEXT);
@@ -166,10 +256,28 @@ $database = new Database();
 $user = new User($database);
 $notes = new Notes($database);
 
-// Handle form submissions
+// Initialize messages and errors
 $message = '';
 $error = '';
-$userNotes = []; // Initialize userNotes to an empty array
+$userNotes = []; 
+
+// Centralized Session Validation Check
+// This must run before any other logic that relies on $_SESSION['user_id']
+if (isset($_SESSION['user_id'])) {
+    $stmt = $database->getConnection()->prepare('SELECT session_version FROM users WHERE id = ?');
+    $stmt->bindValue(1, $_SESSION['user_id'], SQLITE3_INTEGER);
+    $result = $stmt->execute();
+    $dbUser = $result->fetchArray(SQLITE3_ASSOC);
+
+    // If user not found (deleted?) or session version mismatch, invalidate session
+    if (!$dbUser || (isset($_SESSION['session_version']) && $_SESSION['session_version'] != $dbUser['session_version'])) {
+        session_destroy();
+        $_SESSION = array(); // Clear all session variables
+        // Redirect to login with an informative message
+        header('Location: ' . $_SERVER['PHP_SELF'] . '?message=' . urlencode('You have been logged out from all devices due to a password change or forced logout. Please log in again.'));
+        exit;
+    }
+}
 
 // Handle POST requests
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -178,7 +286,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'register':
                 $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
                 $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
-                $password = $_POST['password']; // Password will be hashed, no direct sanitization needed here
+                $password = $_POST['password']; 
                 if ($user->register($username, $email, $password)) {
                     $message = 'Registration successful! Please login.';
                 } else {
@@ -189,11 +297,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             case 'login':
                 $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
                 $password = $_POST['password'];
-                $userData = $user->login($username, $password);
+                $userData = $user->login($username, $password); 
                 if ($userData) {
                     $_SESSION['user_id'] = $userData['id'];
                     $_SESSION['username'] = $userData['username'];
-                    header('Location: ' . $_SERVER['PHP_SELF']); // Redirect to clear POST data
+                    header('Location: ' . $_SERVER['PHP_SELF']); 
                     exit;
                 } else {
                     $error = 'Invalid credentials.';
@@ -202,15 +310,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 
             case 'logout':
                 session_destroy();
+                $_SESSION = array(); 
                 header('Location: ' . $_SERVER['PHP_SELF']);
                 exit;
+                break;
+                
+            case 'logout_all_devices': 
+                if (isset($_SESSION['user_id'])) {
+                    $userId = $_SESSION['user_id'];
+                    if ($user->incrementSessionVersion($userId)) {
+                        session_destroy();
+                        $_SESSION = array(); 
+                        header('Location: ' . $_SERVER['PHP_SELF'] . '?message=' . urlencode('You have successfully logged out from all devices.'));
+                        exit;
+                    } else {
+                        $error = 'Failed to log out from all devices.';
+                    }
+                } else {
+                    $error = 'You must be logged in to perform this action.';
+                }
                 break;
                 
             case 'create_note':
                 if (isset($_SESSION['user_id'])) {
                     $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
                     $content = filter_input(INPUT_POST, 'content', FILTER_SANITIZE_STRING);
-                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: ''; // Sanitize tags
+                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: ''; 
                     if ($notes->create($_SESSION['user_id'], $title, $content, $tags)) {
                         $message = 'Note created successfully!';
                     } else {
@@ -255,7 +380,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $searchTerm = filter_input(INPUT_POST, 'search_term', FILTER_SANITIZE_STRING);
                     $userNotes = $notes->searchNotes($_SESSION['user_id'], $searchTerm);
                     if (empty($userNotes)) {
-                        $message = 'No notes found matching your search.';
+                        $message = 'No notes found matching your search criteria.';
                     } else {
                         $message = 'Search results for "' . htmlspecialchars($searchTerm) . '".';
                     }
@@ -263,27 +388,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $error = 'You must be logged in to search notes.';
                 }
                 break;
+
+            case 'reset_password_from_login_page': 
+                $identifier = filter_input(INPUT_POST, 'identifier', FILTER_SANITIZE_STRING);
+                $oldPassword = $_POST['old_password'];
+                $newPassword = $_POST['new_password'];
+                $confirmNewPassword = $_POST['confirm_new_password'];
+
+                if (empty($identifier) || empty($oldPassword) || empty($newPassword) || empty($confirmNewPassword)) {
+                    $error = 'All fields are required.';
+                } elseif ($newPassword !== $confirmNewPassword) {
+                    $error = 'New password and confirm password do not match.';
+                } elseif (strlen($newPassword) < 6) { 
+                    $error = 'New password must be at least 6 characters long.';
+                } else {
+                    if ($user->resetPasswordFromLogin($identifier, $oldPassword, $newPassword)) {
+                        $message = 'Password updated successfully! Please login with your new password.';
+                        // After password change, destroy current session if one exists to force re-login
+                        if (isset($_SESSION['user_id'])) {
+                            session_destroy();
+                            $_SESSION = array();
+                        }
+                    } else {
+                        $error = 'Failed to update password. Please check your username/email and old password.';
+                    }
+                }
+                break;
         }
     }
     // After handling POST, redirect to prevent form re-submission on refresh
-    // Except for search, which directly updates $userNotes
-    if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
+    // Except for search and login-page password reset, which update displayed data/messages directly.
+    if (!isset($_POST['action']) || !in_array($_POST['action'], ['search_notes', 'reset_password_from_login_page'])) {
         header('Location: ' . $_SERVER['PHP_SELF'] . (isset($_GET['edit']) ? '?edit=' . $_GET['edit'] : ''));
         exit;
     }
 }
 
-// Get current note for editing
+// Get current note for editing (if 'edit' GET parameter is set)
 $editNote = null;
 if (isset($_GET['edit']) && isset($_SESSION['user_id'])) {
     $editNote = $notes->getNote($_GET['edit'], $_SESSION['user_id']);
 }
 
-// If not a search request, fetch all user notes
+// Fetch user notes if not a search request
 if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
     if (isset($_SESSION['user_id'])) {
         $userNotes = $notes->getUserNotes($_SESSION['user_id']);
     }
+}
+
+// Check for messages passed via GET (e.g., after logout all devices)
+if (isset($_GET['message'])) {
+    $message = htmlspecialchars($_GET['message']);
 }
 
 ?>
@@ -294,6 +450,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notes App</title>
+    <!-- Font Awesome for icons -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
     <style>
         /* General Reset & Base Styles */
@@ -326,13 +483,13 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
 
         /* Authentication Forms */
         .auth-container {
-            max-width: 450px; /* Slightly larger for better spacing */
-            margin: 50px auto; /* Adjust margin */
+            max-width: 450px; 
+            margin: 50px auto; 
             background: white;
             padding: 40px;
             border-radius: 15px;
             box-shadow: 0 10px 25px rgba(0,0,0,0.15);
-            animation: fadeIn 0.5s ease-out; /* Add fade-in animation */
+            animation: fadeIn 0.5s ease-out; 
         }
 
         .auth-container h2 {
@@ -352,8 +509,8 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             justify-content: space-between;
             align-items: center;
             box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-            border-radius: 15px 15px 0 0; /* Rounded top corners */
-            margin-bottom: 20px; /* Space from content */
+            border-radius: 15px 15px 0 0; 
+            margin-bottom: 20px; 
         }
 
         .welcome {
@@ -362,7 +519,14 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             font-weight: 600;
         }
 
-        .logout-btn {
+        .header-actions {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap; 
+            justify-content: flex-end;
+        }
+
+        .logout-btn, .logout-all-btn {
             background: #e74c3c;
             color: white;
             border: none;
@@ -372,12 +536,22 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             font-weight: 500;
             transition: background 0.3s ease, transform 0.2s ease;
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            display: inline-flex; 
+            align-items: center; 
+            gap: 8px; 
         }
 
-        .logout-btn:hover {
+        .logout-btn:hover, .logout-all-btn:hover {
             background: #c0392b;
             transform: translateY(-2px);
         }
+        .logout-all-btn {
+            background: #f39c12; 
+        }
+        .logout-all-btn:hover {
+            background: #e67e22;
+        }
+
 
         /* Main Content Layout */
         .main-content {
@@ -385,12 +559,12 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             grid-template-columns: 1fr 2fr;
             gap: 30px;
             padding: 30px;
-            background: white; /* Ensure content area is white */
-            border-radius: 0 0 15px 15px; /* Rounded bottom corners */
+            background: white; 
+            border-radius: 0 0 15px 15px; 
         }
 
-        .note-form, .notes-list {
-            background: #fdfdfd; /* Lighter background for sections */
+        .note-form, .notes-list { 
+            background: #fdfdfd; 
             padding: 30px;
             border-radius: 15px;
             box-shadow: 0 8px 20px rgba(0,0,0,0.08);
@@ -398,9 +572,9 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
         }
 
         .notes-list {
-            min-height: 400px; /* Ensure list has some height */
+            min-height: 400px; 
         }
-
+        
         /* Form Elements */
         .form-group {
             margin-bottom: 20px;
@@ -484,7 +658,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             padding: 20px;
             margin-bottom: 20px;
             border-radius: 10px;
-            border-left: 5px solid #667eea; /* Stronger accent */
+            border-left: 5px solid #667eea; 
             box-shadow: 0 4px 12px rgba(0,0,0,0.05);
             transition: transform 0.2s ease;
         }
@@ -505,8 +679,8 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             margin-bottom: 15px;
             line-height: 1.6;
             font-size: 15px;
-            white-space: pre-wrap; /* Preserve whitespace and line breaks */
-            word-wrap: break-word; /* Break long words */
+            white-space: pre-wrap; 
+            word-wrap: break-word; 
         }
         
         .note-tags {
@@ -537,7 +711,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
         .note-actions {
             display: flex;
             gap: 10px;
-            flex-wrap: wrap; /* Allow buttons to wrap on smaller screens */
+            flex-wrap: wrap; 
         }
 
         .note-actions button, .note-actions a.btn {
@@ -552,7 +726,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             margin-bottom: 20px;
             border-radius: 8px;
             font-weight: 500;
-            opacity: 0; /* Start hidden for animation */
+            opacity: 0; 
             animation: fadeIn 0.5s ease-out forwards;
         }
 
@@ -572,6 +746,10 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
         .auth-toggle {
             text-align: center;
             margin-top: 25px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
         }
 
         .auth-toggle a {
@@ -615,15 +793,15 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
 
         /* Custom Modal for Confirmation */
         .modal {
-            display: none; /* Hidden by default */
-            position: fixed; /* Stay in place */
-            z-index: 1000; /* Sit on top */
+            display: none; 
+            position: fixed; 
+            z-index: 1000; 
             left: 0;
             top: 0;
-            width: 100%; /* Full width */
-            height: 100%; /* Full height */
-            overflow: auto; /* Enable scroll if needed */
-            background-color: rgba(0,0,0,0.5); /* Black w/ opacity */
+            width: 100%; 
+            height: 100%; 
+            overflow: auto; 
+            background-color: rgba(0,0,0,0.5); 
             display: flex;
             align-items: center;
             justify-content: center;
@@ -674,7 +852,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
         /* Responsive Design */
         @media (max-width: 992px) {
             .main-content {
-                grid-template-columns: 1fr; /* Stack columns on medium screens */
+                grid-template-columns: 1fr; 
                 padding: 20px;
             }
             .app-header {
@@ -687,8 +865,12 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
                 font-size: 20px;
                 text-align: center;
             }
-            .logout-btn {
+            .header-actions {
                 width: 100%;
+                justify-content: center;
+            }
+            .logout-btn, .logout-all-btn {
+                flex-grow: 1; 
             }
             .search-bar {
                 flex-direction: column;
@@ -728,6 +910,10 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
                 font-size: 13px;
                 padding: 6px 10px;
             }
+            .auth-toggle {
+                flex-direction: column;
+                gap: 10px;
+            }
         }
     </style>
 </head>
@@ -759,7 +945,8 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
                         <button type="submit" class="btn">Login</button>
                     </form>
                     <div class="auth-toggle">
-                        <a href="#" onclick="toggleForm()">Don't have an account? Sign up</a>
+                        <a href="#" onclick="toggleForm('register')">Don't have an account? Sign Up</a>
+                        <a href="#" onclick="toggleForm('forgot_password')">Forgot Password?</a>
                     </div>
                 </div>
 
@@ -782,7 +969,37 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
                         <button type="submit" class="btn">Sign Up</button>
                     </form>
                     <div class="auth-toggle">
-                        <a href="#" onclick="toggleForm()">Already have an account? Login</a>
+                        <a href="#" onclick="toggleForm('login')">Already have an account? Login</a>
+                        <a href="#" onclick="toggleForm('forgot_password')">Forgot Password?</a>
+                    </div>
+                </div>
+
+                <div id="forgot-password-form" style="display: none;">
+                    <h2>Reset Password</h2>
+                    <p style="text-align: center; color: #777; margin-bottom: 25px;">To reset your password, please enter your username or email, your old password, and your new password.</p>
+                    <form method="POST">
+                        <input type="hidden" name="action" value="reset_password_from_login_page">
+                        <div class="form-group">
+                            <label for="forgot-identifier">Username or Email:</label>
+                            <input type="text" id="forgot-identifier" name="identifier" required autocomplete="username">
+                        </div>
+                        <div class="form-group">
+                            <label for="forgot-old-password">Old Password:</label>
+                            <input type="password" id="forgot-old-password" name="old_password" required autocomplete="current-password">
+                        </div>
+                        <div class="form-group">
+                            <label for="forgot-new-password">New Password:</label>
+                            <input type="password" id="forgot-new-password" name="new_password" required autocomplete="new-password">
+                        </div>
+                        <div class="form-group">
+                            <label for="forgot-confirm-new-password">Confirm New Password:</label>
+                            <input type="password" id="forgot-confirm-new-password" name="confirm_new_password" required autocomplete="new-password">
+                        </div>
+                        <button type="submit" class="btn"><i class="fas fa-key"></i> Reset Password</button>
+                    </form>
+                    <div class="auth-toggle">
+                        <a href="#" onclick="toggleForm('login')">Back to Login</a>
+                        <a href="#" onclick="toggleForm('register')">Sign Up</a>
                     </div>
                 </div>
             </div>
@@ -791,10 +1008,16 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             <!-- Main Application -->
             <div class="app-header">
                 <div class="welcome">Welcome, <?php echo htmlspecialchars($_SESSION['username']); ?>!</div>
-                <form method="POST" style="display: inline;">
-                    <input type="hidden" name="action" value="logout">
-                    <button type="submit" class="logout-btn">Logout</button>
-                </form>
+                <div class="header-actions">
+                    <form method="POST" style="display: inline;">
+                        <input type="hidden" name="action" value="logout_all_devices">
+                        <button type="submit" class="logout-all-btn"><i class="fas fa-sign-out-alt"></i> Logout All Devices</button>
+                    </form>
+                    <form method="POST" style="display: inline;">
+                        <input type="hidden" name="action" value="logout">
+                        <button type="submit" class="logout-btn"><i class="fas fa-power-off"></i> Logout</button>
+                    </form>
+                </div>
             </div>
 
             <div class="main-content">
@@ -837,8 +1060,7 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
                             </button>
                             <?php if ($editNote): ?>
                                 <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex">
-                                    <i class="fas fa-times-circle"></i>
-                                    Cancel
+                                    <i class="fas fa-times-circle"></i> Cancel
                                 </a>
                             <?php endif; ?>
                         </div>
@@ -912,17 +1134,24 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
     </div>
 
     <script>
-        // Function to toggle between login and registration forms
-        function toggleForm() {
+        // Function to toggle between login, register, and forgot password forms
+        function toggleForm(formToShow) {
             const loginForm = document.getElementById('login-form');
             const registerForm = document.getElementById('register-form');
+            const forgotPasswordForm = document.getElementById('forgot-password-form');
             
-            if (loginForm.style.display === 'none') {
+            // Hide all forms first
+            loginForm.style.display = 'none';
+            registerForm.style.display = 'none';
+            forgotPasswordForm.style.display = 'none';
+
+            // Show the requested form
+            if (formToShow === 'login') {
                 loginForm.style.display = 'block';
-                registerForm.style.display = 'none';
-            } else {
-                loginForm.style.display = 'none';
+            } else if (formToShow === 'register') {
                 registerForm.style.display = 'block';
+            } else if (formToShow === 'forgot_password') {
+                forgotPasswordForm.style.display = 'block';
             }
         }
 
@@ -995,21 +1224,29 @@ if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
             const successMessage = document.querySelector('.message.success');
             const errorMessage = document.querySelector('.message.error');
             
+            // Function to animate message hiding
+            const hideMessage = (element) => {
+                element.style.transition = 'opacity 1s ease-out, height 1s ease-out, padding 1s ease-out, margin-bottom 1s ease-out';
+                element.style.opacity = '0';
+                element.style.height = '0';
+                element.style.padding = '0';
+                element.style.marginBottom = '0';
+                element.addEventListener('transitionend', () => element.remove(), { once: true }); // Remove after transition
+            };
+
             if (successMessage) {
-                setTimeout(() => {
-                    successMessage.style.opacity = '0';
-                    successMessage.style.height = '0';
-                    successMessage.style.padding = '0';
-                    successMessage.style.marginBottom = '0';
-                }, 5000); // Hide after 5 seconds
+                setTimeout(() => hideMessage(successMessage), 5000); 
             }
             if (errorMessage) {
-                setTimeout(() => {
-                    errorMessage.style.opacity = '0';
-                    errorMessage.style.height = '0';
-                    errorMessage.style.padding = '0';
-                    errorMessage.style.marginBottom = '0';
-                }, 5000); // Hide after 5 seconds
+                setTimeout(() => hideMessage(errorMessage), 5000); 
+            }
+            
+            // Initial toggle based on query parameters or default to login
+            const urlParams = new URLSearchParams(window.location.search);
+            // If there's a message from a redirect, it means an action happened.
+            // We want to default to the login form for unauthenticated users.
+            if (!<?php echo isset($_SESSION['user_id']) ? 'true' : 'false'; ?>) {
+                toggleForm('login'); 
             }
         });
 
