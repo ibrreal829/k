@@ -6,7 +6,10 @@ class Database {
     private $db;
     
     public function __construct() {
+        // Create or open the SQLite database file
         $this->db = new SQLite3('notes_app.db');
+        // Ensure write access for the database file
+        $this->db->exec('PRAGMA journal_mode = WAL;'); // Enable Write-Ahead Logging for better concurrency
         $this->createTables();
     }
     
@@ -22,18 +25,25 @@ class Database {
             )
         ');
         
-        // Notes table
+        // Notes table with new 'tags' column
+        // Added IF NOT EXISTS for columns to allow schema evolution without dropping table
         $this->db->exec('
             CREATE TABLE IF NOT EXISTS notes (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
                 title TEXT NOT NULL,
                 content TEXT NOT NULL,
+                tags TEXT DEFAULT "", -- New column for comma-separated tags
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (user_id) REFERENCES users (id)
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
             )
         ');
+
+        // Add 'tags' column if it doesn't exist (for existing databases)
+        $this->db->exec("
+            ALTER TABLE notes ADD COLUMN tags TEXT DEFAULT ''
+        ");
     }
     
     public function getConnection() {
@@ -51,6 +61,7 @@ class User {
     
     public function register($username, $email, $password) {
         $hashedPassword = password_hash($password, PASSWORD_DEFAULT);
+        // Prepare statement to prevent SQL injection
         $stmt = $this->db->prepare('INSERT INTO users (username, email, password) VALUES (?, ?, ?)');
         $stmt->bindValue(1, $username, SQLITE3_TEXT);
         $stmt->bindValue(2, $email, SQLITE3_TEXT);
@@ -59,6 +70,7 @@ class User {
     }
     
     public function login($username, $password) {
+        // Allow login using either username or email
         $stmt = $this->db->prepare('SELECT * FROM users WHERE username = ? OR email = ?');
         $stmt->bindValue(1, $username, SQLITE3_TEXT);
         $stmt->bindValue(2, $username, SQLITE3_TEXT);
@@ -80,14 +92,17 @@ class Notes {
         $this->db = $database->getConnection();
     }
     
-    public function create($userId, $title, $content) {
-        $stmt = $this->db->prepare('INSERT INTO notes (user_id, title, content) VALUES (?, ?, ?)');
+    // Create a new note with title, content, and tags
+    public function create($userId, $title, $content, $tags = '') {
+        $stmt = $this->db->prepare('INSERT INTO notes (user_id, title, content, tags) VALUES (?, ?, ?, ?)');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $title, SQLITE3_TEXT);
         $stmt->bindValue(3, $content, SQLITE3_TEXT);
+        $stmt->bindValue(4, $tags, SQLITE3_TEXT);
         return $stmt->execute();
     }
     
+    // Get all notes for a specific user, ordered by last updated
     public function getUserNotes($userId) {
         $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? ORDER BY updated_at DESC');
         $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
@@ -100,6 +115,7 @@ class Notes {
         return $notes;
     }
     
+    // Get a single note by ID and user ID
     public function getNote($noteId, $userId) {
         $stmt = $this->db->prepare('SELECT * FROM notes WHERE id = ? AND user_id = ?');
         $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
@@ -108,20 +124,40 @@ class Notes {
         return $result->fetchArray(SQLITE3_ASSOC);
     }
     
-    public function update($noteId, $userId, $title, $content) {
-        $stmt = $this->db->prepare('UPDATE notes SET title = ?, content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
+    // Update an existing note
+    public function update($noteId, $userId, $title, $content, $tags = '') {
+        $stmt = $this->db->prepare('UPDATE notes SET title = ?, content = ?, tags = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?');
         $stmt->bindValue(1, $title, SQLITE3_TEXT);
         $stmt->bindValue(2, $content, SQLITE3_TEXT);
-        $stmt->bindValue(3, $noteId, SQLITE3_INTEGER);
-        $stmt->bindValue(4, $userId, SQLITE3_INTEGER);
+        $stmt->bindValue(3, $tags, SQLITE3_TEXT); // Update tags as well
+        $stmt->bindValue(4, $noteId, SQLITE3_INTEGER);
+        $stmt->bindValue(5, $userId, SQLITE3_INTEGER);
         return $stmt->execute();
     }
     
+    // Delete a note
     public function delete($noteId, $userId) {
         $stmt = $this->db->prepare('DELETE FROM notes WHERE id = ? AND user_id = ?');
         $stmt->bindValue(1, $noteId, SQLITE3_INTEGER);
         $stmt->bindValue(2, $userId, SQLITE3_INTEGER);
         return $stmt->execute();
+    }
+
+    // Search notes by title, content, or tags for a given user
+    public function searchNotes($userId, $searchTerm) {
+        $searchTerm = '%' . $searchTerm . '%'; // Wildcard for LIKE queries
+        $stmt = $this->db->prepare('SELECT * FROM notes WHERE user_id = ? AND (title LIKE ? OR content LIKE ? OR tags LIKE ?) ORDER BY updated_at DESC');
+        $stmt->bindValue(1, $userId, SQLITE3_INTEGER);
+        $stmt->bindValue(2, $searchTerm, SQLITE3_TEXT);
+        $stmt->bindValue(3, $searchTerm, SQLITE3_TEXT);
+        $stmt->bindValue(4, $searchTerm, SQLITE3_TEXT);
+        $result = $stmt->execute();
+
+        $searchResults = [];
+        while ($row = $result->fetchArray(SQLITE3_ASSOC)) {
+            $searchResults[] = $row;
+        }
+        return $searchResults;
     }
 }
 
@@ -133,12 +169,17 @@ $notes = new Notes($database);
 // Handle form submissions
 $message = '';
 $error = '';
+$userNotes = []; // Initialize userNotes to an empty array
 
-if ($_POST) {
+// Handle POST requests
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($_POST['action'])) {
         switch ($_POST['action']) {
             case 'register':
-                if ($user->register($_POST['username'], $_POST['email'], $_POST['password'])) {
+                $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
+                $email = filter_input(INPUT_POST, 'email', FILTER_SANITIZE_EMAIL);
+                $password = $_POST['password']; // Password will be hashed, no direct sanitization needed here
+                if ($user->register($username, $email, $password)) {
                     $message = 'Registration successful! Please login.';
                 } else {
                     $error = 'Registration failed. Username or email might already exist.';
@@ -146,11 +187,13 @@ if ($_POST) {
                 break;
                 
             case 'login':
-                $userData = $user->login($_POST['username'], $_POST['password']);
+                $username = filter_input(INPUT_POST, 'username', FILTER_SANITIZE_STRING);
+                $password = $_POST['password'];
+                $userData = $user->login($username, $password);
                 if ($userData) {
                     $_SESSION['user_id'] = $userData['id'];
                     $_SESSION['username'] = $userData['username'];
-                    header('Location: ' . $_SERVER['PHP_SELF']);
+                    header('Location: ' . $_SERVER['PHP_SELF']); // Redirect to clear POST data
                     exit;
                 } else {
                     $error = 'Invalid credentials.';
@@ -165,34 +208,68 @@ if ($_POST) {
                 
             case 'create_note':
                 if (isset($_SESSION['user_id'])) {
-                    if ($notes->create($_SESSION['user_id'], $_POST['title'], $_POST['content'])) {
+                    $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
+                    $content = filter_input(INPUT_POST, 'content', FILTER_SANITIZE_STRING);
+                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: ''; // Sanitize tags
+                    if ($notes->create($_SESSION['user_id'], $title, $content, $tags)) {
                         $message = 'Note created successfully!';
                     } else {
                         $error = 'Failed to create note.';
                     }
+                } else {
+                    $error = 'You must be logged in to create a note.';
                 }
                 break;
                 
             case 'update_note':
                 if (isset($_SESSION['user_id'])) {
-                    if ($notes->update($_POST['note_id'], $_SESSION['user_id'], $_POST['title'], $_POST['content'])) {
+                    $noteId = filter_input(INPUT_POST, 'note_id', FILTER_SANITIZE_NUMBER_INT);
+                    $title = filter_input(INPUT_POST, 'title', FILTER_SANITIZE_STRING);
+                    $content = filter_input(INPUT_POST, 'content', FILTER_SANITIZE_STRING);
+                    $tags = filter_input(INPUT_POST, 'tags', FILTER_SANITIZE_STRING) ?: '';
+                    if ($notes->update($noteId, $_SESSION['user_id'], $title, $content, $tags)) {
                         $message = 'Note updated successfully!';
                     } else {
                         $error = 'Failed to update note.';
                     }
+                } else {
+                    $error = 'You must be logged in to update a note.';
                 }
                 break;
                 
             case 'delete_note':
                 if (isset($_SESSION['user_id'])) {
-                    if ($notes->delete($_POST['note_id'], $_SESSION['user_id'])) {
+                    $noteId = filter_input(INPUT_POST, 'note_id', FILTER_SANITIZE_NUMBER_INT);
+                    if ($notes->delete($noteId, $_SESSION['user_id'])) {
                         $message = 'Note deleted successfully!';
                     } else {
                         $error = 'Failed to delete note.';
                     }
+                } else {
+                    $error = 'You must be logged in to delete a note.';
+                }
+                break;
+            
+            case 'search_notes':
+                if (isset($_SESSION['user_id'])) {
+                    $searchTerm = filter_input(INPUT_POST, 'search_term', FILTER_SANITIZE_STRING);
+                    $userNotes = $notes->searchNotes($_SESSION['user_id'], $searchTerm);
+                    if (empty($userNotes)) {
+                        $message = 'No notes found matching your search.';
+                    } else {
+                        $message = 'Search results for "' . htmlspecialchars($searchTerm) . '".';
+                    }
+                } else {
+                    $error = 'You must be logged in to search notes.';
                 }
                 break;
         }
+    }
+    // After handling POST, redirect to prevent form re-submission on refresh
+    // Except for search, which directly updates $userNotes
+    if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
+        header('Location: ' . $_SERVER['PHP_SELF'] . (isset($_GET['edit']) ? '?edit=' . $_GET['edit'] : ''));
+        exit;
     }
 }
 
@@ -202,11 +279,13 @@ if (isset($_GET['edit']) && isset($_SESSION['user_id'])) {
     $editNote = $notes->getNote($_GET['edit'], $_SESSION['user_id']);
 }
 
-// Get user notes
-$userNotes = [];
-if (isset($_SESSION['user_id'])) {
-    $userNotes = $notes->getUserNotes($_SESSION['user_id']);
+// If not a search request, fetch all user notes
+if (!isset($_POST['action']) || $_POST['action'] !== 'search_notes') {
+    if (isset($_SESSION['user_id'])) {
+        $userNotes = $notes->getUserNotes($_SESSION['user_id']);
+    }
 }
+
 ?>
 
 <!DOCTYPE html>
@@ -215,7 +294,9 @@ if (isset($_SESSION['user_id'])) {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Notes App</title>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css" rel="stylesheet">
     <style>
+        /* General Reset & Base Styles */
         * {
             margin: 0;
             padding: 0;
@@ -223,40 +304,61 @@ if (isset($_SESSION['user_id'])) {
         }
 
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-family: 'Inter', sans-serif; /* Using Inter font */
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             padding: 20px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
         }
 
         .container {
             max-width: 1200px;
+            width: 100%;
             margin: 0 auto;
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
+            background: rgba(255, 255, 255, 0.9); /* Slightly transparent background for modern look */
         }
 
+        /* Authentication Forms */
         .auth-container {
-            max-width: 400px;
-            margin: 100px auto;
+            max-width: 450px; /* Slightly larger for better spacing */
+            margin: 50px auto; /* Adjust margin */
             background: white;
             padding: 40px;
             border-radius: 15px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.15);
+            animation: fadeIn 0.5s ease-out; /* Add fade-in animation */
         }
 
+        .auth-container h2 {
+            text-align: center;
+            color: #333;
+            margin-bottom: 30px;
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        /* App Header */
         .app-header {
             background: white;
-            padding: 20px;
-            border-radius: 15px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            margin-bottom: 30px;
+            padding: 20px 30px;
+            border-bottom: 1px solid #e1e8ed;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            border-radius: 15px 15px 0 0; /* Rounded top corners */
+            margin-bottom: 20px; /* Space from content */
         }
 
         .welcome {
             color: #333;
-            font-size: 24px;
+            font-size: 22px;
             font-weight: 600;
         }
 
@@ -268,33 +370,38 @@ if (isset($_SESSION['user_id'])) {
             border-radius: 8px;
             cursor: pointer;
             font-weight: 500;
+            transition: background 0.3s ease, transform 0.2s ease;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
 
         .logout-btn:hover {
             background: #c0392b;
+            transform: translateY(-2px);
         }
 
+        /* Main Content Layout */
         .main-content {
             display: grid;
             grid-template-columns: 1fr 2fr;
             gap: 30px;
+            padding: 30px;
+            background: white; /* Ensure content area is white */
+            border-radius: 0 0 15px 15px; /* Rounded bottom corners */
         }
 
-        .note-form {
-            background: white;
+        .note-form, .notes-list {
+            background: #fdfdfd; /* Lighter background for sections */
             padding: 30px;
             border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            box-shadow: 0 8px 20px rgba(0,0,0,0.08);
             height: fit-content;
         }
 
         .notes-list {
-            background: white;
-            padding: 30px;
-            border-radius: 15px;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            min-height: 400px; /* Ensure list has some height */
         }
 
+        /* Form Elements */
         .form-group {
             margin-bottom: 20px;
         }
@@ -302,8 +409,9 @@ if (isset($_SESSION['user_id'])) {
         .form-group label {
             display: block;
             margin-bottom: 8px;
-            color: #333;
-            font-weight: 500;
+            color: #555;
+            font-weight: 600;
+            font-size: 15px;
         }
 
         .form-group input,
@@ -313,13 +421,15 @@ if (isset($_SESSION['user_id'])) {
             border: 2px solid #e1e8ed;
             border-radius: 8px;
             font-size: 16px;
-            transition: border-color 0.3s;
+            color: #333;
+            transition: border-color 0.3s ease, box-shadow 0.3s ease;
         }
 
         .form-group input:focus,
         .form-group textarea:focus {
             outline: none;
             border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.2);
         }
 
         .form-group textarea {
@@ -327,6 +437,7 @@ if (isset($_SESSION['user_id'])) {
             resize: vertical;
         }
 
+        /* Buttons */
         .btn {
             background: #667eea;
             color: white;
@@ -336,11 +447,14 @@ if (isset($_SESSION['user_id'])) {
             cursor: pointer;
             font-size: 16px;
             font-weight: 500;
-            transition: background 0.3s;
+            transition: background 0.3s ease, transform 0.2s ease, box-shadow 0.2s ease;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
 
         .btn:hover {
             background: #5a67d8;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 12px rgba(0,0,0,0.15);
         }
 
         .btn-secondary {
@@ -358,18 +472,30 @@ if (isset($_SESSION['user_id'])) {
         .btn-danger:hover {
             background: #c0392b;
         }
+        .btn-inline-flex {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
 
+        /* Note Cards */
         .note-card {
-            background: #f8f9fa;
+            background: #ffffff;
             padding: 20px;
             margin-bottom: 20px;
             border-radius: 10px;
-            border-left: 4px solid #667eea;
+            border-left: 5px solid #667eea; /* Stronger accent */
+            box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+            transition: transform 0.2s ease;
+        }
+
+        .note-card:hover {
+            transform: translateY(-3px);
         }
 
         .note-title {
-            font-size: 18px;
-            font-weight: 600;
+            font-size: 20px;
+            font-weight: 700;
             color: #333;
             margin-bottom: 10px;
         }
@@ -378,29 +504,56 @@ if (isset($_SESSION['user_id'])) {
             color: #666;
             margin-bottom: 15px;
             line-height: 1.6;
+            font-size: 15px;
+            white-space: pre-wrap; /* Preserve whitespace and line breaks */
+            word-wrap: break-word; /* Break long words */
+        }
+        
+        .note-tags {
+            font-size: 13px;
+            color: #4a5568;
+            margin-bottom: 10px;
+        }
+
+        .note-tag {
+            background: #e2e8f0;
+            color: #4a5568;
+            padding: 4px 8px;
+            border-radius: 5px;
+            margin-right: 5px;
+            display: inline-block;
+            margin-bottom: 5px;
         }
 
         .note-meta {
             font-size: 12px;
             color: #999;
             margin-bottom: 15px;
+            border-top: 1px solid #eee;
+            padding-top: 10px;
+            margin-top: 15px;
         }
 
         .note-actions {
             display: flex;
             gap: 10px;
+            flex-wrap: wrap; /* Allow buttons to wrap on smaller screens */
         }
 
-        .note-actions button {
-            padding: 6px 12px;
+        .note-actions button, .note-actions a.btn {
+            padding: 8px 15px;
             font-size: 14px;
+            border-radius: 6px;
         }
 
+        /* Messages */
         .message {
-            padding: 15px;
+            padding: 15px 25px;
             margin-bottom: 20px;
             border-radius: 8px;
             font-weight: 500;
+            opacity: 0; /* Start hidden for animation */
+            animation: fadeIn 0.5s ease-out forwards;
         }
 
         .message.success {
@@ -415,33 +568,165 @@ if (isset($_SESSION['user_id'])) {
             border: 1px solid #f5c6cb;
         }
 
+        /* Auth Toggle */
         .auth-toggle {
             text-align: center;
-            margin-top: 20px;
+            margin-top: 25px;
         }
 
         .auth-toggle a {
             color: #667eea;
             text-decoration: none;
+            font-weight: 600;
+            transition: color 0.3s ease;
         }
 
         .auth-toggle a:hover {
+            color: #5a67d8;
             text-decoration: underline;
         }
 
         h1, h2 {
             color: #333;
             margin-bottom: 20px;
+            text-align: center;
+        }
+
+        /* Search Bar */
+        .search-bar {
+            margin-bottom: 30px;
+            display: flex;
+            gap: 10px;
+        }
+
+        .search-bar input {
+            flex-grow: 1;
+            padding: 12px;
+            border: 2px solid #e1e8ed;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+
+        .search-bar input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+
+        /* Custom Modal for Confirmation */
+        .modal {
+            display: none; /* Hidden by default */
+            position: fixed; /* Stay in place */
+            z-index: 1000; /* Sit on top */
+            left: 0;
+            top: 0;
+            width: 100%; /* Full width */
+            height: 100%; /* Full height */
+            overflow: auto; /* Enable scroll if needed */
+            background-color: rgba(0,0,0,0.5); /* Black w/ opacity */
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .modal-content {
+            background-color: #fefefe;
+            margin: auto;
+            padding: 30px;
+            border: 1px solid #888;
+            border-radius: 15px;
+            width: 90%;
+            max-width: 400px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            text-align: center;
+            animation: zoomIn 0.3s ease-out;
+        }
+
+        .modal-content h3 {
+            margin-bottom: 20px;
+            color: #333;
+            font-size: 24px;
+        }
+
+        .modal-content p {
+            margin-bottom: 30px;
+            color: #666;
+            font-size: 16px;
+        }
+
+        .modal-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+        }
+
+        /* Animations */
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes zoomIn {
+            from { opacity: 0; transform: scale(0.9); }
+            to { opacity: 1; transform: scale(1); }
+        }
+
+        /* Responsive Design */
+        @media (max-width: 992px) {
+            .main-content {
+                grid-template-columns: 1fr; /* Stack columns on medium screens */
+                padding: 20px;
+            }
+            .app-header {
+                flex-direction: column;
+                gap: 15px;
+                padding: 15px;
+                border-radius: 10px 10px 0 0;
+            }
+            .welcome {
+                font-size: 20px;
+                text-align: center;
+            }
+            .logout-btn {
+                width: 100%;
+            }
+            .search-bar {
+                flex-direction: column;
+                gap: 10px;
+            }
         }
 
         @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
+            body {
+                padding: 15px;
             }
-            
+            .container {
+                border-radius: 10px;
+            }
             .auth-container {
-                margin: 50px auto;
+                margin: 30px auto;
                 padding: 30px;
+                border-radius: 10px;
+            }
+            .main-content {
+                padding: 15px;
+                border-radius: 0 0 10px 10px;
+            }
+            .note-form, .notes-list {
+                padding: 20px;
+                border-radius: 10px;
+            }
+            .note-card {
+                padding: 15px;
+                border-radius: 8px;
+            }
+            .form-group input, .form-group textarea, .btn {
+                padding: 10px;
+                font-size: 15px;
+            }
+            .note-actions button, .note-actions a.btn {
+                font-size: 13px;
+                padding: 6px 10px;
             }
         }
     </style>
@@ -464,12 +749,12 @@ if (isset($_SESSION['user_id'])) {
                     <form method="POST">
                         <input type="hidden" name="action" value="login">
                         <div class="form-group">
-                            <label>Username or Email:</label>
-                            <input type="text" name="username" required>
+                            <label for="login-username">Username or Email:</label>
+                            <input type="text" id="login-username" name="username" required autocomplete="username">
                         </div>
                         <div class="form-group">
-                            <label>Password:</label>
-                            <input type="password" name="password" required>
+                            <label for="login-password">Password:</label>
+                            <input type="password" id="login-password" name="password" required autocomplete="current-password">
                         </div>
                         <button type="submit" class="btn">Login</button>
                     </form>
@@ -483,16 +768,16 @@ if (isset($_SESSION['user_id'])) {
                     <form method="POST">
                         <input type="hidden" name="action" value="register">
                         <div class="form-group">
-                            <label>Username:</label>
-                            <input type="text" name="username" required>
+                            <label for="reg-username">Username:</label>
+                            <input type="text" id="reg-username" name="username" required autocomplete="new-username">
                         </div>
                         <div class="form-group">
-                            <label>Email:</label>
-                            <input type="email" name="email" required>
+                            <label for="reg-email">Email:</label>
+                            <input type="email" id="reg-email" name="email" required autocomplete="email">
                         </div>
                         <div class="form-group">
-                            <label>Password:</label>
-                            <input type="password" name="password" required>
+                            <label for="reg-password">Password:</label>
+                            <input type="password" id="reg-password" name="password" required autocomplete="new-password">
                         </div>
                         <button type="submit" class="btn">Sign Up</button>
                     </form>
@@ -512,36 +797,49 @@ if (isset($_SESSION['user_id'])) {
                 </form>
             </div>
 
-            <?php if ($message): ?>
-                <div class="message success"><?php echo htmlspecialchars($message); ?></div>
-            <?php endif; ?>
-            
-            <?php if ($error): ?>
-                <div class="message error"><?php echo htmlspecialchars($error); ?></div>
-            <?php endif; ?>
-
             <div class="main-content">
+                <!-- Message Display Area -->
+                <div style="grid-column: 1 / -1;">
+                    <?php if ($message): ?>
+                        <div class="message success"><?php echo htmlspecialchars($message); ?></div>
+                    <?php endif; ?>
+                    
+                    <?php if ($error): ?>
+                        <div class="message error"><?php echo htmlspecialchars($error); ?></div>
+                    <?php endif; ?>
+                </div>
+
                 <!-- Note Form -->
                 <div class="note-form">
                     <h2><?php echo $editNote ? 'Edit Note' : 'Create New Note'; ?></h2>
                     <form method="POST">
                         <input type="hidden" name="action" value="<?php echo $editNote ? 'update_note' : 'create_note'; ?>">
                         <?php if ($editNote): ?>
-                            <input type="hidden" name="note_id" value="<?php echo $editNote['id']; ?>">
+                            <input type="hidden" name="note_id" value="<?php echo htmlspecialchars($editNote['id']); ?>">
                         <?php endif; ?>
                         
                         <div class="form-group">
-                            <label>Title:</label>
-                            <input type="text" name="title" value="<?php echo $editNote ? htmlspecialchars($editNote['title']) : ''; ?>" required>
+                            <label for="note-title">Title:</label>
+                            <input type="text" id="note-title" name="title" value="<?php echo $editNote ? htmlspecialchars($editNote['title']) : ''; ?>" required>
                         </div>
                         <div class="form-group">
-                            <label>Content:</label>
-                            <textarea name="content" required><?php echo $editNote ? htmlspecialchars($editNote['content']) : ''; ?></textarea>
+                            <label for="note-content">Content:</label>
+                            <textarea id="note-content" name="content" required><?php echo $editNote ? htmlspecialchars($editNote['content']) : ''; ?></textarea>
                         </div>
-                        <div style="display: flex; gap: 10px;">
-                            <button type="submit" class="btn"><?php echo $editNote ? 'Update Note' : 'Create Note'; ?></button>
+                        <div class="form-group">
+                            <label for="note-tags">Tags (comma-separated):</label>
+                            <input type="text" id="note-tags" name="tags" value="<?php echo $editNote ? htmlspecialchars($editNote['tags']) : ''; ?>" placeholder="e.g., work, personal, important">
+                        </div>
+                        <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+                            <button type="submit" class="btn btn-inline-flex">
+                                <i class="fas <?php echo $editNote ? 'fa-save' : 'fa-plus-circle'; ?>"></i>
+                                <?php echo $editNote ? 'Update Note' : 'Create Note'; ?>
+                            </button>
                             <?php if ($editNote): ?>
-                                <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary">Cancel</a>
+                                <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex">
+                                    <i class="fas fa-times-circle"></i>
+                                    Cancel
+                                </a>
                             <?php endif; ?>
                         </div>
                     </form>
@@ -550,13 +848,34 @@ if (isset($_SESSION['user_id'])) {
                 <!-- Notes List -->
                 <div class="notes-list">
                     <h2>Your Notes</h2>
+                    <form method="POST" class="search-bar">
+                        <input type="hidden" name="action" value="search_notes">
+                        <input type="text" name="search_term" placeholder="Search notes by title, content, or tags..." value="<?php echo isset($_POST['search_term']) ? htmlspecialchars($_POST['search_term']) : ''; ?>">
+                        <button type="submit" class="btn btn-inline-flex"><i class="fas fa-search"></i> Search</button>
+                        <?php if (isset($_POST['action']) && $_POST['action'] === 'search_notes'): ?>
+                            <a href="<?php echo $_SERVER['PHP_SELF']; ?>" class="btn btn-secondary btn-inline-flex"><i class="fas fa-redo"></i> Reset</a>
+                        <?php endif; ?>
+                    </form>
+
                     <?php if (empty($userNotes)): ?>
-                        <p>No notes yet. Create your first note!</p>
+                        <p>No notes found. Create your first note!</p>
                     <?php else: ?>
                         <?php foreach ($userNotes as $note): ?>
                             <div class="note-card">
                                 <div class="note-title"><?php echo htmlspecialchars($note['title']); ?></div>
-                                <div class="note-content"><?php echo nl2br(htmlspecialchars(substr($note['content'], 0, 200))); ?><?php echo strlen($note['content']) > 200 ? '...' : ''; ?></div>
+                                <div class="note-content"><?php echo nl2br(htmlspecialchars(substr($note['content'], 0, 300))); ?><?php echo strlen($note['content']) > 300 ? '...' : ''; ?></div>
+                                <?php if (!empty($note['tags'])): ?>
+                                    <div class="note-tags">
+                                        <?php 
+                                            $tagsArray = array_map('trim', explode(',', $note['tags']));
+                                            foreach($tagsArray as $tag) {
+                                                if (!empty($tag)) {
+                                                    echo '<span class="note-tag">' . htmlspecialchars($tag) . '</span>';
+                                                }
+                                            }
+                                        ?>
+                                    </div>
+                                <?php endif; ?>
                                 <div class="note-meta">
                                     Created: <?php echo date('M j, Y g:i A', strtotime($note['created_at'])); ?>
                                     <?php if ($note['updated_at'] != $note['created_at']): ?>
@@ -564,12 +883,13 @@ if (isset($_SESSION['user_id'])) {
                                     <?php endif; ?>
                                 </div>
                                 <div class="note-actions">
-                                    <a href="?edit=<?php echo $note['id']; ?>" class="btn btn-secondary">Edit</a>
-                                    <form method="POST" style="display: inline;" onsubmit="return confirm('Are you sure you want to delete this note?')">
-                                        <input type="hidden" name="action" value="delete_note">
-                                        <input type="hidden" name="note_id" value="<?php echo $note['id']; ?>">
-                                        <button type="submit" class="btn btn-danger">Delete</button>
-                                    </form>
+                                    <a href="?edit=<?php echo htmlspecialchars($note['id']); ?>" class="btn btn-secondary btn-inline-flex">
+                                        <i class="fas fa-edit"></i> Edit
+                                    </a>
+                                    <button type="button" class="btn btn-danger btn-inline-flex" 
+                                            onclick="showConfirmModal(<?php echo htmlspecialchars($note['id']); ?>, 'delete_note')">
+                                        <i class="fas fa-trash-alt"></i> Delete
+                                    </button>
                                 </div>
                             </div>
                         <?php endforeach; ?>
@@ -579,7 +899,20 @@ if (isset($_SESSION['user_id'])) {
         <?php endif; ?>
     </div>
 
+    <!-- Custom Confirmation Modal -->
+    <div id="confirmModal" class="modal">
+        <div class="modal-content">
+            <h3>Confirm Action</h3>
+            <p id="modalMessage">Are you sure you want to proceed?</p>
+            <div class="modal-buttons">
+                <button type="button" class="btn btn-danger" id="confirmYes">Yes</button>
+                <button type="button" class="btn btn-secondary" id="confirmNo">No</button>
+            </div>
+        </div>
+    </div>
+
     <script>
+        // Function to toggle between login and registration forms
         function toggleForm() {
             const loginForm = document.getElementById('login-form');
             const registerForm = document.getElementById('register-form');
@@ -592,6 +925,94 @@ if (isset($_SESSION['user_id'])) {
                 registerForm.style.display = 'block';
             }
         }
+
+        // Custom Confirmation Modal Logic
+        const confirmModal = document.getElementById('confirmModal');
+        const modalMessage = document.getElementById('modalMessage');
+        const confirmYesBtn = document.getElementById('confirmYes');
+        const confirmNoBtn = document.getElementById('confirmNo');
+        let currentActionCallback = null; // Stores the function to call on confirmation
+
+        function showConfirmModal(noteId, actionType) {
+            let message = '';
+            let formAction = '';
+
+            if (actionType === 'delete_note') {
+                message = 'Are you sure you want to delete this note? This action cannot be undone.';
+                formAction = 'delete_note';
+            }
+            // Add other action types here if needed (e.g., 'archive_note')
+
+            modalMessage.textContent = message;
+            confirmModal.style.display = 'flex'; // Show modal
+
+            // Set the callback for when 'Yes' is clicked
+            currentActionCallback = () => {
+                const form = document.createElement('form');
+                form.method = 'POST';
+                form.style.display = 'none';
+
+                const actionInput = document.createElement('input');
+                actionInput.type = 'hidden';
+                actionInput.name = 'action';
+                actionInput.value = formAction;
+                form.appendChild(actionInput);
+
+                const noteIdInput = document.createElement('input');
+                noteIdInput.type = 'hidden';
+                noteIdInput.name = 'note_id';
+                noteIdInput.value = noteId;
+                form.appendChild(noteIdInput);
+
+                document.body.appendChild(form);
+                form.submit(); // Submit the form
+            };
+        }
+
+        // Event listeners for modal buttons
+        confirmYesBtn.onclick = function() {
+            confirmModal.style.display = 'none';
+            if (currentActionCallback) {
+                currentActionCallback(); // Execute the stored callback
+            }
+        };
+
+        confirmNoBtn.onclick = function() {
+            confirmModal.style.display = 'none';
+            currentActionCallback = null; // Clear the callback
+        };
+
+        // Close modal if user clicks outside of it
+        window.onclick = function(event) {
+            if (event.target == confirmModal) {
+                confirmModal.style.display = "none";
+                currentActionCallback = null;
+            }
+        }
+
+        // Automatically hide messages after a few seconds
+        document.addEventListener('DOMContentLoaded', (event) => {
+            const successMessage = document.querySelector('.message.success');
+            const errorMessage = document.querySelector('.message.error');
+            
+            if (successMessage) {
+                setTimeout(() => {
+                    successMessage.style.opacity = '0';
+                    successMessage.style.height = '0';
+                    successMessage.style.padding = '0';
+                    successMessage.style.marginBottom = '0';
+                }, 5000); // Hide after 5 seconds
+            }
+            if (errorMessage) {
+                setTimeout(() => {
+                    errorMessage.style.opacity = '0';
+                    errorMessage.style.height = '0';
+                    errorMessage.style.padding = '0';
+                    errorMessage.style.marginBottom = '0';
+                }, 5000); // Hide after 5 seconds
+            }
+        });
+
     </script>
 </body>
 </html>
